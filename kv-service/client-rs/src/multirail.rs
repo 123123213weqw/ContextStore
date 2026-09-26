@@ -2206,6 +2206,18 @@ mod tests {
     }
 
     #[test]
+    fn cancel_token_is_shared_and_maps_to_cancelled() {
+        let token = CancelToken::new();
+        let observer = token.clone();
+        assert!(!token.is_cancelled());
+        // 取消在克隆之间共享同一标志; wave 边界/背压等待/应答收集点
+        // 经 check() 协作退出, 映射为类型化 Cancelled 错误。
+        observer.cancel();
+        assert!(token.is_cancelled());
+        assert!(matches!(token.check(), Err(MultiRailError::Cancelled)));
+    }
+
+    #[test]
     fn checksum_verification_matches_server_encoding() {
         let mut buffer = vec![0u8; 16];
         buffer[..8].copy_from_slice(b"stripe0!");
