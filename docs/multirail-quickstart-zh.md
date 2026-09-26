@@ -188,3 +188,19 @@ CS_RDMA_DEVICES="mlx5_0:192.168.10.1:50053:3,mlx5_1:192.168.11.1:50054:3" ...
 
 软 RDMA 的内核 CPU 封包路径使单进程内收益受限（~0.3 GiB/s 天花板），负载均衡本身精确到字节；
 真实网卡为硬件 DMA 卸载，不存在该瓶颈。分析详见设计文档 §3。
+
+## 11. 兼容矩阵
+
+| 维度 | 支持情况 | 说明 |
+|---|---|---|
+| 单轨 / 关闭多轨 | ✅ 行为等价旧路径 | 仅配一条 rail 或沿用原 `RdmaClient` 均可 |
+| 旧客户端 ↔ 新服务端 | ✅ | 服务端多轨能力仅依赖既有 `CS_RDMA_DEVICES`，协议未变 |
+| 新客户端 ↔ 旧服务端 | ✅ | stripe-subset GET（tag 12/15）为既有协议；placement 无校验和时跳过该校验 |
+| Soft-RoCE (rxe) | ✅ 实测 | 本仓库默认验证环境；内核 rxe 跨设备路径有缺陷时用轨 pin + 端点交替规避 |
+| 实体 RoCE 网卡 (mlx5 / irdma) | ✅ 设计支持 | `--rails "mlx5_0:1:3,mlx5_1:1:3"`；同网段免 pin，跨路由配 `hop_limit` |
+| gRPC-only 构建（无 rdma feature） | ✅ 零依赖变化 | multirail 模块由 `rdma` feature 门控 |
+| path MTU | ✅ 可配置 | 客户端/轨/服务端 `CS_RDMA_PATH_MTU`，两端一致，默认 1024 |
+| 硬件 e2e / bench 门控 | ✅ | `CS_MR_*` 环境变量驱动，见 §7 |
+| 上游回归 | ✅ | `make e2e`、clippy 双模式、`cargo fmt`、Python pytest 全绿 |
+
+升级方式：客户端按需启用多轨（显式配置 rails 才激活），单轨部署无需任何配置变更。
