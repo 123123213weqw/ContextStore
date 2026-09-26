@@ -76,6 +76,9 @@ class _CsMrRailStats(ctypes.Structure):
         ("connections_quiesced", ctypes.c_uint64),
         ("inflight_requests", ctypes.c_uint64),
         ("inflight_bytes", ctypes.c_uint64),
+        ("latency_avg_us", ctypes.c_uint64),
+        ("latency_max_us", ctypes.c_uint64),
+        ("registered_bytes", ctypes.c_uint64),
         ("device", ctypes.c_char * 64),
         ("topology", ctypes.c_char * 160),
     ]
@@ -96,6 +99,9 @@ class RailStats:
     connections_quiesced: int
     inflight_requests: int
     inflight_bytes: int
+    latency_avg_us: int
+    latency_max_us: int
+    registered_bytes: int
 
     def __str__(self) -> str:
         return (
@@ -104,7 +110,9 @@ class RailStats:
             f"ok={self.requests_ok} err={self.requests_err} tmo={self.timeouts} "
             f"read={self.bytes_read >> 20}MiB conns=+{self.connections_created}"
             f"/~{self.connections_quiesced} "
-            f"inflight=(req:{self.inflight_requests},B:{self.inflight_bytes})"
+            f"inflight=(req:{self.inflight_requests},B:{self.inflight_bytes}) "
+            f"lat=(avg:{self.latency_avg_us}us,max:{self.latency_max_us}us) "
+            f"reg={self.registered_bytes >> 20}MiB"
         )
 
 
@@ -253,6 +261,9 @@ class MultiRailReader:
                     connections_quiesced=entry.connections_quiesced,
                     inflight_requests=entry.inflight_requests,
                     inflight_bytes=entry.inflight_bytes,
+                    latency_avg_us=entry.latency_avg_us,
+                    latency_max_us=entry.latency_max_us,
+                    registered_bytes=entry.registered_bytes,
                 )
             )
         return stats

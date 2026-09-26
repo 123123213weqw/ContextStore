@@ -482,6 +482,11 @@ struct RailStats {
     connections_quiesced: AtomicU64,
     inflight_requests: AtomicU64,
     inflight_bytes: AtomicU64,
+    /// Sum and max of per-request latencies (µs); avg = sum / requests_ok.
+    latency_us_sum: AtomicU64,
+    latency_us_max: AtomicU64,
+    /// Bytes currently pinned by cached memory registrations on this rail.
+    registered_bytes: AtomicU64,
 }
 
 /// Point-in-time view of one rail for observability.
@@ -500,13 +505,16 @@ pub struct RailSnapshot {
     pub connections_quiesced: u64,
     pub inflight_requests: u64,
     pub inflight_bytes: u64,
+    pub latency_avg_us: u64,
+    pub latency_max_us: u64,
+    pub registered_bytes: u64,
 }
 
 impl fmt::Display for RailSnapshot {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "rail[{}] {} {} healthy={} cooldown={}ms ok={} err={} tmo={} read={}MiB conns=+{}/~{} inflight=(req:{},B:{})",
+            "rail[{}] {} {} healthy={} cooldown={}ms ok={} err={} tmo={} read={}MiB conns=+{}/~{} inflight=(req:{},B:{}) lat=(avg:{}us,max:{}us) reg={}MiB",
             self.index,
             self.device,
             self.topology,
@@ -520,6 +528,9 @@ impl fmt::Display for RailSnapshot {
             self.connections_quiesced,
             self.inflight_requests,
             self.inflight_bytes,
+            self.latency_avg_us,
+            self.latency_max_us,
+            self.registered_bytes >> 20,
         )
     }
 }
@@ -1093,21 +1104,37 @@ fn conn_worker(
             } => {
                 let (expected_bytes, expected_chunks) =
                     expected_task_outcome(&descriptor, &stripes);
+                let started = Instant::now();
                 let outcome = (|| -> Result<Option<rdma::GetOutcome>, String> {
                     // SAFETY: dst_base..dst_base+dst_len stays valid and
                     // unmoved for the whole read call — the dispatcher joins
                     // every worker before returning, and registrations for
                     // non-sticky buffers are evicted synchronously at the end
                     // of each read.
+                    let before = client.registered_cache_bytes();
                     let view = unsafe {
                         client
                             .register_raw_buffer_cached(dst_base as *mut u8, dst_len)
                             .map_err(|error| error.to_string())?
                     };
+                    let registered_now = client.registered_cache_bytes();
+                    if registered_now > before {
+                        rail.stats.registered_bytes.fetch_add(
+                            (registered_now - before) as u64,
+                            Ordering::Relaxed,
+                        );
+                    }
                     client
                         .get_descriptor_stripes_into_view_detailed(&descriptor, &stripes, view, 0)
                         .map_err(|error| error.to_string())
                 })();
+                rail.stats
+                    .latency_us_sum
+                    .fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
+                rail.stats.latency_us_max.fetch_max(
+                    started.elapsed().as_micros() as u64,
+                    Ordering::Relaxed,
+                );
                 let _ = reply.send(TaskReply {
                     rail_index: rail.index,
                     endpoint: Arc::clone(&endpoint),
@@ -1117,7 +1144,8 @@ fn conn_worker(
                 });
             }
             Command::EvictRegistration { base, ack } => {
-                client.evict_registrations_for(base);
+                let freed = client.evict_registrations_for(base);
+                rail.stats.registered_bytes.fetch_sub(freed as u64, Ordering::Relaxed);
                 let _ = ack.send(());
             }
             Command::Stop => break,
@@ -1220,6 +1248,13 @@ impl MultiRailClient {
                     connections_quiesced: s.connections_quiesced.load(Ordering::Relaxed),
                     inflight_requests: s.inflight_requests.load(Ordering::Relaxed),
                     inflight_bytes: s.inflight_bytes.load(Ordering::Relaxed),
+                    latency_avg_us: s
+                        .latency_us_sum
+                        .load(Ordering::Relaxed)
+                        .checked_div(s.requests_ok.load(Ordering::Relaxed))
+                        .unwrap_or(0),
+                    latency_max_us: s.latency_us_max.load(Ordering::Relaxed),
+                    registered_bytes: s.registered_bytes.load(Ordering::Relaxed),
                 }
             })
             .collect()

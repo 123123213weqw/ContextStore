@@ -687,13 +687,18 @@ impl RdmaClient {
     }
 
     /// Drop every cached registration whose base pointer is `base`,
-    /// deregistering the memory regions. Returns how many entries were
-    /// evicted. Multi-rail callers use this to quiesce registrations of a
-    /// caller buffer synchronously before returning it.
+    /// deregistering the memory regions. Returns how many bytes were
+    /// deregistered. Multi-rail callers use this to quiesce registrations of
+    /// a caller buffer synchronously before returning it.
     pub fn evict_registrations_for(&mut self, base: usize) -> usize {
-        let before = self.mr_cache.len();
+        let before = self.mr_cache.iter().map(|((ptr, len), _)| if *ptr == base { *len } else { 0 }).sum();
         self.mr_cache.retain(|((ptr, _), _)| *ptr != base);
-        before - self.mr_cache.len()
+        before
+    }
+
+    /// Total bytes currently pinned by cached registrations.
+    pub fn registered_cache_bytes(&self) -> usize {
+        self.mr_cache.iter().map(|((_, len), _)| *len).sum()
     }
 
     /// Stripe-subset GET with a scatter destination list (wire tag 15): the

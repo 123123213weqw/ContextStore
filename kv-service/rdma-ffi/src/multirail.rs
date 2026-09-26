@@ -104,6 +104,9 @@ pub struct CsMrRailStats {
     pub connections_quiesced: u64,
     pub inflight_requests: u64,
     pub inflight_bytes: u64,
+    pub latency_avg_us: u64,
+    pub latency_max_us: u64,
+    pub registered_bytes: u64,
     pub device: [c_char; 64],
     pub topology: [c_char; 160],
 }
@@ -303,6 +306,9 @@ pub unsafe extern "C" fn cs_mr_rail_stats(
             connections_quiesced: snapshot.connections_quiesced,
             inflight_requests: snapshot.inflight_requests,
             inflight_bytes: snapshot.inflight_bytes,
+            latency_avg_us: snapshot.latency_avg_us,
+            latency_max_us: snapshot.latency_max_us,
+            registered_bytes: snapshot.registered_bytes,
             device: [0; 64],
             topology: [0; 160],
         };
