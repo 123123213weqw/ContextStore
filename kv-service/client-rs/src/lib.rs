@@ -634,9 +634,9 @@ impl KvClient {
             let offset = usize::try_from(chunk.offset).map_err(|_| {
                 tonic::Status::internal(format!("negative chunk offset {}", chunk.offset))
             })?;
-            let end = offset.checked_add(chunk.data.len()).ok_or_else(|| {
-                tonic::Status::internal("chunk offset + length overflows usize")
-            })?;
+            let end = offset
+                .checked_add(chunk.data.len())
+                .ok_or_else(|| tonic::Status::internal("chunk offset + length overflows usize"))?;
             if end > dst.len() {
                 return Err(tonic::Status::internal(format!(
                     "chunk [{offset}, {end}) exceeds destination buffer of {} bytes",

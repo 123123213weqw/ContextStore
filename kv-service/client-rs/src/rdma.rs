@@ -691,7 +691,11 @@ impl RdmaClient {
     /// deregistered. Multi-rail callers use this to quiesce registrations of
     /// a caller buffer synchronously before returning it.
     pub fn evict_registrations_for(&mut self, base: usize) -> usize {
-        let before = self.mr_cache.iter().map(|((ptr, len), _)| if *ptr == base { *len } else { 0 }).sum();
+        let before = self
+            .mr_cache
+            .iter()
+            .map(|((ptr, len), _)| if *ptr == base { *len } else { 0 })
+            .sum();
         self.mr_cache.retain(|((ptr, _), _)| *ptr != base);
         before
     }

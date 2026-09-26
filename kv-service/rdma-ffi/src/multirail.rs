@@ -128,9 +128,9 @@ unsafe fn cstr<'a>(ptr: *const c_char) -> Result<&'a str, MultiRailError> {
     if ptr.is_null() {
         return Err(MultiRailError::InvalidPlacement("null string".into()));
     }
-    CStr::from_ptr(ptr).to_str().map_err(|_| {
-        MultiRailError::InvalidPlacement("non-utf8 string in descriptor".into())
-    })
+    CStr::from_ptr(ptr)
+        .to_str()
+        .map_err(|_| MultiRailError::InvalidPlacement("non-utf8 string in descriptor".into()))
 }
 
 #[no_mangle]
@@ -141,7 +141,12 @@ pub unsafe extern "C" fn cs_mr_new(
 ) -> *mut c_void {
     let mut rails = Vec::with_capacity(rail_count as usize);
     for index in 0..rail_count as usize {
-        let spec = match rail_specs.add(index).read().as_ref().and_then(|p| CStr::from_ptr(p).to_str().ok()) {
+        let spec = match rail_specs
+            .add(index)
+            .read()
+            .as_ref()
+            .and_then(|p| CStr::from_ptr(p).to_str().ok())
+        {
             Some(spec) => spec,
             None => return std::ptr::null_mut(),
         };
@@ -156,7 +161,9 @@ pub unsafe extern "C" fn cs_mr_new(
     };
     match MultiRailClient::new(rails) {
         Ok(client) => Box::into_raw(Box::new(MrReader {
-            client: client.with_limits(limits).with_policy(RailSelectPolicy::LeastLoaded),
+            client: client
+                .with_limits(limits)
+                .with_policy(RailSelectPolicy::LeastLoaded),
         })) as *mut c_void,
         Err(_) => std::ptr::null_mut(),
     }
@@ -252,9 +259,13 @@ pub unsafe extern "C" fn cs_mr_read(
     } else {
         // SAFETY: the caller guarantees buffer..buffer+len stays valid and
         // unmoved for the duration of the call (it is synchronous).
-        reader
-            .client
-            .read_object_into_raw(&pb_descriptor, &pb_chunks, buffer, buffer_len as usize, false)
+        reader.client.read_object_into_raw(
+            &pb_descriptor,
+            &pb_chunks,
+            buffer,
+            buffer_len as usize,
+            false,
+        )
     };
     match result {
         Ok(bytes) => bytes as i64,

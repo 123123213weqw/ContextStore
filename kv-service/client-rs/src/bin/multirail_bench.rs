@@ -188,16 +188,17 @@ fn format_coordinator(url: &str) -> String {
 }
 
 fn lookup(args: &Args, runtime: &tokio::runtime::Runtime) -> Result<ObjectLookup> {
-    runtime.block_on(async {
-        let mut client = KvClient::connect(format_coordinator(&args.coordinator))
-            .await
-            .map_err(|error| anyhow!(error.to_string()))?;
-        client
-            .lookup_object(&args.namespace, &args.object_key)
-            .await
-            .map_err(|error| anyhow!(error.to_string()))
-    })?
-    .ok_or_else(|| anyhow!("object not found: {}/{}", args.namespace, args.object_key))
+    runtime
+        .block_on(async {
+            let mut client = KvClient::connect(format_coordinator(&args.coordinator))
+                .await
+                .map_err(|error| anyhow!(error.to_string()))?;
+            client
+                .lookup_object(&args.namespace, &args.object_key)
+                .await
+                .map_err(|error| anyhow!(error.to_string()))
+        })?
+        .ok_or_else(|| anyhow!("object not found: {}/{}", args.namespace, args.object_key))
 }
 
 fn run_client(
@@ -213,7 +214,9 @@ fn run_client(
         task_max_stripes: args.task_max_stripes,
         ..RailLimits::default()
     };
-    let client = MultiRailClient::new(rails)?.with_limits(limits).with_policy(policy);
+    let client = MultiRailClient::new(rails)?
+        .with_limits(limits)
+        .with_policy(policy);
     let mut buffer = AlignedBuffer::new(args.buf_mb * 1024 * 1024)?;
     let object_size = usize::try_from(lookup.descriptor.size)?;
 
@@ -241,7 +244,11 @@ fn run_client(
             unsafe {
                 client.read_object_into_raw(
                     &lookup.descriptor,
-                    &lookup.placement.as_ref().map(|p| p.chunks.clone()).unwrap_or_default(),
+                    &lookup
+                        .placement
+                        .as_ref()
+                        .map(|p| p.chunks.clone())
+                        .unwrap_or_default(),
                     buffer.ptr,
                     buffer.len,
                     true,
@@ -259,7 +266,10 @@ fn run_client(
             ));
         }
         if args.verify {
-            verify_pattern(&buffer.as_mut()[..object_size], &format!("{label}#{iteration}"))?;
+            verify_pattern(
+                &buffer.as_mut()[..object_size],
+                &format!("{label}#{iteration}"),
+            )?;
         }
     }
 
@@ -267,7 +277,10 @@ fn run_client(
         println!("[{label}]   {snapshot}");
     }
     let total: f64 = latencies.iter().map(|d| d.as_secs_f64()).sum();
-    let best = latencies.iter().map(|d| d.as_secs_f64()).fold(f64::INFINITY, f64::min);
+    let best = latencies
+        .iter()
+        .map(|d| d.as_secs_f64())
+        .fold(f64::INFINITY, f64::min);
     let gbps = object_size as f64 / 1024f64.powi(3) / (total / latencies.len() as f64);
     println!(
         "[{label}] avg={:.3}s best={:.3}s avg_bw={:.3} GiB/s over {} iterations",
@@ -308,7 +321,9 @@ fn main() -> Result<()> {
     }
     let mut lookup = lookup(&args, &runtime)?;
     if lookup.placement.is_none() {
-        return Err(anyhow!("lookup returned no placement (is the object striped?)"));
+        return Err(anyhow!(
+            "lookup returned no placement (is the object striped?)"
+        ));
     }
     let original_lookup = lookup.clone();
     // Reachability indirection: rewrite placement endpoints through the map

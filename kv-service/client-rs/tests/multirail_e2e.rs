@@ -11,9 +11,7 @@
 
 #![cfg(feature = "rdma")]
 
-use contextstore_client_rs::multirail::{
-    MultiRailClient, MultiRailError, RailConfig, RailLimits,
-};
+use contextstore_client_rs::multirail::{MultiRailClient, MultiRailError, RailConfig, RailLimits};
 use contextstore_client_rs::{KvClient, ObjectLookup};
 use prost::bytes::Bytes;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -136,27 +134,26 @@ fn seed(namespace: &str, key: &str, size_mb: usize) -> Fixture {
     let mut payload = vec![0u8; size];
     fill_pattern(&mut payload);
     let coordinator = env_or("CS_MR_COORDINATOR", "http://127.0.0.1:50051");
-    let lookup = runtime
-        .block_on(async {
-            let mut client = KvClient::connect(coordinator)
-                .await
-                .expect("connect gRPC coordinator");
-            let big = Bytes::from(payload);
-            let chunk = 4 * 1024 * 1024;
-            let mut segments = Vec::new();
-            for offset in (0..size).step_by(chunk) {
-                segments.push(big.slice(offset..(offset + chunk).min(size)));
-            }
-            client
-                .put_stream_chunks(namespace, key, segments)
-                .await
-                .expect("seed object over gRPC");
-            client
-                .lookup_object(namespace, key)
-                .await
-                .expect("lookup seeded object")
-                .expect("seeded object present")
-        });
+    let lookup = runtime.block_on(async {
+        let mut client = KvClient::connect(coordinator)
+            .await
+            .expect("connect gRPC coordinator");
+        let big = Bytes::from(payload);
+        let chunk = 4 * 1024 * 1024;
+        let mut segments = Vec::new();
+        for offset in (0..size).step_by(chunk) {
+            segments.push(big.slice(offset..(offset + chunk).min(size)));
+        }
+        client
+            .put_stream_chunks(namespace, key, segments)
+            .await
+            .expect("seed object over gRPC");
+        client
+            .lookup_object(namespace, key)
+            .await
+            .expect("lookup seeded object")
+            .expect("seeded object present")
+    });
     Fixture {
         runtime,
         namespace: namespace.to_string(),
@@ -286,21 +283,19 @@ fn stale_descriptor_is_reported_as_relookup() {
     let mut payload = vec![0u8; fixture.size];
     fill_pattern(&mut payload);
     payload[0] ^= 0xFF; // different content → different etag/generation
-    fixture
-        .runtime
-        .block_on(async {
-            let mut client = KvClient::connect(coordinator)
-                .await
-                .expect("connect coordinator");
-            client
-                .delete(&fixture.namespace, &fixture.key)
-                .await
-                .expect("delete old version");
-            client
-                .put(&fixture.namespace, &fixture.key, payload)
-                .await
-                .expect("rewrite object");
-        });
+    fixture.runtime.block_on(async {
+        let mut client = KvClient::connect(coordinator)
+            .await
+            .expect("connect coordinator");
+        client
+            .delete(&fixture.namespace, &fixture.key)
+            .await
+            .expect("delete old version");
+        client
+            .put(&fixture.namespace, &fixture.key, payload)
+            .await
+            .expect("rewrite object");
+    });
 
     let client = MultiRailClient::new(rails_from_env())
         .expect("create client")
