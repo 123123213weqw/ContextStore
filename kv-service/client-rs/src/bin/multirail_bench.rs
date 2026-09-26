@@ -61,6 +61,14 @@ struct Args {
     /// (rail, endpoint).
     #[arg(long, default_value = "0")]
     task_max_stripes: usize,
+    /// GRH hop limit for all rails (routed RoCE needs more than 1).
+    #[arg(long, default_value = "1")]
+    hop_limit: u8,
+    /// Endpoint rewrite map for reachability indirection, e.g.
+    /// `10.0.0.2:50053=127.0.0.1:15053`: placement endpoints on the left are
+    /// dialed via the right (RDMA GIDs are exchanged in-band and unaffected).
+    #[arg(long, value_delimiter = ',')]
+    endpoint_map: Vec<String>,
     #[arg(long, default_value = "5")]
     iters: usize,
     /// Destination buffer size in MiB (>= object size).
@@ -303,6 +311,24 @@ fn main() -> Result<()> {
         return Err(anyhow!("lookup returned no placement (is the object striped?)"));
     }
     let original_lookup = lookup.clone();
+    // Reachability indirection: rewrite placement endpoints through the map
+    // (the RDMA GID exchange travels inside the control stream, so the data
+    // path is unaffected by the TCP detour).
+    let endpoint_map: HashMap<String, String> = args
+        .endpoint_map
+        .iter()
+        .filter_map(|spec| spec.split_once('='))
+        .map(|(from, to)| (from.trim().to_string(), to.trim().to_string()))
+        .collect();
+    if !endpoint_map.is_empty() {
+        if let Some(placement) = lookup.placement.as_mut() {
+            for chunk in placement.chunks.iter_mut() {
+                if let Some(to) = endpoint_map.get(&chunk.rdma_endpoint) {
+                    chunk.rdma_endpoint = to.clone();
+                }
+            }
+        }
+    }
     if !args.alternate_endpoints.is_empty() {
         // Spread the node's stripes over its listeners so several rails can
         // carry the object concurrently.
@@ -326,6 +352,9 @@ fn main() -> Result<()> {
                 }
                 if args.qp_mtu != 1024 {
                     rail.mtu = args.qp_mtu;
+                }
+                if args.hop_limit != 1 {
+                    rail.hop_limit = args.hop_limit;
                 }
                 rail
             })

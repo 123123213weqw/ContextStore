@@ -68,6 +68,8 @@ pub struct RdmaClientConfig {
     /// RC path MTU in bytes (512/1024/2048/4096). Must not exceed the network
     /// MTU; jumbo-frame RoCE fabrics want 4096.
     pub path_mtu: u16,
+    /// GRH hop limit. 1 fits same-subnet fabrics; routed RoCE needs more.
+    pub hop_limit: u8,
 }
 
 impl RdmaClientConfig {
@@ -81,6 +83,7 @@ impl RdmaClientConfig {
             io_timeout: None,
             connect_timeout: None,
             path_mtu: 1024,
+            hop_limit: 1,
         }
     }
 
@@ -111,6 +114,12 @@ impl RdmaClientConfig {
     /// Set the RC path MTU in bytes (rounded down to 512/1024/2048/4096).
     pub fn with_path_mtu(mut self, bytes: u16) -> Self {
         self.path_mtu = bytes;
+        self
+    }
+
+    /// Set the GRH hop limit (routed RoCE fabrics need more than 1).
+    pub fn with_hop_limit(mut self, hops: u8) -> Self {
+        self.hop_limit = hops;
         self
     }
 }
@@ -431,7 +440,14 @@ impl RdmaClient {
             };
             write_hello(&mut stream, local)?;
             let remote = read_hello(&mut stream)?;
-            transition_qp_to_rtr(qp, &remote, config.port, config.gid_index, config.path_mtu)?;
+            transition_qp_to_rtr(
+                qp,
+                &remote,
+                config.port,
+                config.gid_index,
+                config.path_mtu,
+                config.hop_limit,
+            )?;
             transition_qp_to_rts(qp, local.psn)?;
             Ok(stream)
         })();
@@ -1124,6 +1140,7 @@ fn transition_qp_to_rtr(
     port: u8,
     gid_index: u8,
     path_mtu_bytes: u16,
+    hop_limit: u8,
 ) -> Result<()> {
     unsafe {
         let mut attr: ibv_qp_attr = std::mem::zeroed();
@@ -1136,7 +1153,7 @@ fn transition_qp_to_rtr(
         attr.ah_attr.is_global = 1;
         attr.ah_attr.port_num = port;
         attr.ah_attr.grh.dgid = remote.gid;
-        attr.ah_attr.grh.hop_limit = 1;
+        attr.ah_attr.grh.hop_limit = hop_limit;
         attr.ah_attr.grh.sgid_index = gid_index;
         let mask = ibv_qp_attr_mask::IBV_QP_STATE
             | ibv_qp_attr_mask::IBV_QP_AV

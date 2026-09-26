@@ -92,6 +92,8 @@ pub struct RailConfig {
     /// RC path MTU in bytes; 4096 on jumbo-frame fabrics, 1024 (default) on
     /// standard 1500-byte networks.
     pub mtu: u16,
+    /// GRH hop limit; routed RoCE fabrics need more than the default 1.
+    pub hop_limit: u8,
     /// Optional endpoint whitelist (`host:port` or bare `host`). Empty means
     /// the rail may serve any endpoint. Rail-optimized fabrics pin rail k to
     /// fabric k; soft-RoCE cross-wired testbeds use it the same way.
@@ -106,6 +108,7 @@ impl RailConfig {
             gid_index: 3,
             weight: 1,
             mtu: 1024,
+            hop_limit: 1,
             endpoints: Vec::new(),
         }
     }
@@ -131,6 +134,12 @@ impl RailConfig {
         self
     }
 
+    /// Set the GRH hop limit (routed RoCE needs more than 1).
+    pub fn with_hop_limit(mut self, hops: u8) -> Self {
+        self.hop_limit = hops;
+        self
+    }
+
     /// Restrict this rail to the given endpoints (`host:port` or bare host).
     pub fn with_endpoints(mut self, endpoints: Vec<String>) -> Self {
         self.endpoints = endpoints;
@@ -149,8 +158,21 @@ impl RailConfig {
             .any(|allowed| allowed == endpoint || *allowed == host)
     }
 
-    /// Parse `device[:port[:gid[:weight[:mtu]]]]` (omitted parts keep defaults).
+    /// Parse `device[:port[:gid[:weight[:mtu]]]][@ep[;ep...]]` (omitted
+    /// parts keep defaults). The optional `@` suffix pins the rail to an
+    /// endpoint whitelist (`host:port` or bare host, `;`-separated).
     pub fn parse(spec: &str) -> Option<Self> {
+        let (spec, endpoints) = match spec.split_once('@') {
+            Some((left, right)) => (
+                left,
+                right
+                    .split(';')
+                    .map(|ep| ep.trim().to_string())
+                    .filter(|ep| !ep.is_empty())
+                    .collect::<Vec<_>>(),
+            ),
+            None => (spec, Vec::new()),
+        };
         let mut parts = spec.split(':');
         let device = parts.next()?.trim();
         if device.is_empty() {
@@ -168,6 +190,9 @@ impl RailConfig {
         }
         if let Some(mtu) = parts.next().and_then(|m| m.trim().parse().ok()) {
             config = config.with_mtu(mtu);
+        }
+        if !endpoints.is_empty() {
+            config = config.with_endpoints(endpoints);
         }
         Some(config)
     }
@@ -279,6 +304,7 @@ pub enum MultiRailError {
         actual: String,
     },
     WorkerPanic { rail: String, endpoint: String },
+    Cancelled,
 }
 
 impl fmt::Display for MultiRailError {
@@ -344,11 +370,49 @@ impl fmt::Display for MultiRailError {
             Self::WorkerPanic { rail, endpoint } => {
                 write!(f, "rail {rail} worker for {endpoint} panicked")
             }
+            Self::Cancelled => {
+                write!(f, "read cancelled by caller")
+            }
         }
     }
 }
 
 impl std::error::Error for MultiRailError {}
+
+/// Cooperative cancellation for multi-rail reads.
+///
+/// Clones share the same flag. Cancellation is observed at wave boundaries,
+/// during backpressure waits, and between reply-collection cycles; the
+/// in-flight tasks of the current wave are still drained (bounded by the
+/// read deadline) and every participating connection is quiesced before the
+/// read returns, so cancelling never violates the memory-safety contract.
+#[derive(Clone, Default)]
+pub struct CancelToken {
+    flag: Arc<AtomicBool>,
+}
+
+impl CancelToken {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Request cancellation.
+    pub fn cancel(&self) {
+        self.flag.store(true, Ordering::Release);
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.flag.load(Ordering::Acquire)
+    }
+
+    fn check(&self) -> Result<(), MultiRailError> {
+        if self.is_cancelled() {
+            Err(MultiRailError::Cancelled)
+        } else {
+            Ok(())
+        }
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Topology
@@ -1175,7 +1239,19 @@ impl MultiRailClient {
         buffer: &mut [u8],
     ) -> Result<usize, MultiRailError> {
         let base = buffer.as_mut_ptr() as usize;
-        self.read_impl(descriptor, chunks, base, buffer.len(), false)
+        self.read_impl(descriptor, chunks, base, buffer.len(), false, None)
+    }
+
+    /// [`Self::read_object_into`] with cooperative cancellation.
+    pub fn read_object_into_cancelled(
+        &self,
+        descriptor: &pb::ObjectDescriptor,
+        chunks: &[pb::PlacementChunk],
+        buffer: &mut [u8],
+        cancel: &CancelToken,
+    ) -> Result<usize, MultiRailError> {
+        let base = buffer.as_mut_ptr() as usize;
+        self.read_impl(descriptor, chunks, base, buffer.len(), false, Some(cancel))
     }
 
     /// Convenience wrapper taking a gRPC [`crate::ObjectLookup`] result.
@@ -1214,7 +1290,7 @@ impl MultiRailClient {
                 have: len,
             });
         }
-        self.read_impl(descriptor, chunks, ptr as usize, len, sticky_registration)
+        self.read_impl(descriptor, chunks, ptr as usize, len, sticky_registration, None)
     }
 
     fn read_impl(
@@ -1224,6 +1300,7 @@ impl MultiRailClient {
         base: usize,
         len: usize,
         sticky: bool,
+        cancel: Option<&CancelToken>,
     ) -> Result<usize, MultiRailError> {
         let placement = validate_placement(descriptor, chunks)?;
         if placement.object_size > len as u64 {
@@ -1268,6 +1345,9 @@ impl MultiRailClient {
         let mut verified_bytes = 0u64;
 
         'waves: for wave in waves {
+            if let Some(cancel) = cancel {
+                cancel.check()?;
+            }
             // ---- dispatch this wave ----
             let mut dispatched = 0usize;
             for task in &wave {
@@ -1275,7 +1355,7 @@ impl MultiRailClient {
                     continue;
                 };
                 // Backpressure: wait for per-rail and total byte headroom.
-                if !self.await_headroom(rail, task.bytes, deadline) {
+                if !self.await_headroom(rail, task.bytes, deadline, cancel) {
                     failure = Some(MultiRailError::Timeout {
                         rail: rail.config.device.clone(),
                         endpoint: task.endpoint.to_string(),
@@ -1329,15 +1409,29 @@ impl MultiRailClient {
                     });
                     break;
                 }
-                match reply_rx.recv_timeout(remaining) {
+                if let Some(cancel) = cancel {
+                    if let Err(error) = cancel.check() {
+                        // Drain with a short grace period, then quiesce via
+                        // the failure path below (join still guarantees that
+                        // no work request outlives this call).
+                        failure = Some(error);
+                        break;
+                    }
+                }
+                // Bound each wait so cancellation is observed promptly.
+                let slice = remaining.min(Duration::from_millis(100));
+                match reply_rx.recv_timeout(slice) {
                     Ok(reply) => replies.push(reply),
                     Err(mpsc::RecvTimeoutError::Timeout) => {
-                        failure = Some(MultiRailError::Timeout {
-                            rail: "any".into(),
-                            endpoint: "any".into(),
-                            after_ms: self.limits.io_timeout.as_millis(),
-                        });
-                        break;
+                        if deadline <= Instant::now() {
+                            failure = Some(MultiRailError::Timeout {
+                                rail: "any".into(),
+                                endpoint: "any".into(),
+                                after_ms: self.limits.io_timeout.as_millis(),
+                            });
+                            break;
+                        }
+                        continue;
                     }
                     Err(mpsc::RecvTimeoutError::Disconnected) => {
                         failure = Some(MultiRailError::WorkerPanic {
@@ -1498,8 +1592,19 @@ impl MultiRailClient {
 
     /// Wait until `bytes` more in-flight traffic fits the per-rail and total
     /// budgets, or the deadline passes.
-    fn await_headroom(&self, rail: &Rail, bytes: u64, deadline: Instant) -> bool {
+    fn await_headroom(
+        &self,
+        rail: &Rail,
+        bytes: u64,
+        deadline: Instant,
+        cancel: Option<&CancelToken>,
+    ) -> bool {
         loop {
+            if let Some(cancel) = cancel {
+                if cancel.is_cancelled() {
+                    return false;
+                }
+            }
             let rail_inflight = rail.stats.inflight_bytes.load(Ordering::Relaxed);
             if rail_inflight + bytes <= self.limits.max_inflight_bytes_per_rail {
                 let total: u64 = self

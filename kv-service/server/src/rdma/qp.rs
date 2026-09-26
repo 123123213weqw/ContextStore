@@ -140,6 +140,7 @@ impl RcQp {
         port_num: u8,
         gid_index: u8,
         path_mtu: ibv_mtu::Type,
+        hop_limit: u8,
     ) -> Result<()> {
         unsafe {
             let mut attr: ibv_qp_attr = std::mem::zeroed();
@@ -158,7 +159,7 @@ impl RcQp {
             attr.ah_attr.port_num = port_num;
             attr.ah_attr.grh.dgid = remote.gid;
             attr.ah_attr.grh.flow_label = 0;
-            attr.ah_attr.grh.hop_limit = 1;
+            attr.ah_attr.grh.hop_limit = hop_limit;
             attr.ah_attr.grh.sgid_index = gid_index;
             attr.ah_attr.grh.traffic_class = 0;
 

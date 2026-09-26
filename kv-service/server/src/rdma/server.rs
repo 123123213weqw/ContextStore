@@ -265,7 +265,13 @@ fn handle_client(
     let remote = wire::recv_hello(&mut stream)?;
     wire::send_hello(&mut stream, &qp.local)?;
 
-    qp.to_rtr(&remote, port_num, gid_index, path_mtu_from_env())?;
+    qp.to_rtr(
+        &remote,
+        port_num,
+        gid_index,
+        path_mtu_from_env(),
+        hop_limit_from_env(),
+    )?;
     qp.to_rts()?;
     tracing::info!(
         "RDMA QP established: local_qpn={} remote_qpn={}",
@@ -987,6 +993,14 @@ fn path_mtu_from_env() -> ibv_mtu::Type {
         Some(mtu) if mtu <= 4096 => ibv_mtu::IBV_MTU_4096,
         _ => ibv_mtu::IBV_MTU_1024,
     }
+}
+
+/// GRH hop limit override: CS_RDMA_HOP_LIMIT (default 1, same-subnet).
+fn hop_limit_from_env() -> u8 {
+    std::env::var("CS_RDMA_HOP_LIMIT")
+        .ok()
+        .and_then(|value| value.trim().parse::<u8>().ok())
+        .unwrap_or(1)
 }
 
 fn chunk_is_local(ctx: &KVServiceContext, location: &crate::metadata::ChunkLocation) -> bool {
