@@ -2,6 +2,19 @@
 
 **Tiered shared storage for LLM inference KV caches.**
 
+> ## 🏆 参赛作品：多轨网络设计与实现（上海开源大赛 · DaoCloud 智算云赛道）
+>
+> 本分支（`competition`）在 `kv-service/client-rs` 中实现**多轨 RDMA 读路径**：单个客户端 Worker
+> 通过多张 RDMA 网卡（轨）并行读取同一对象——每轨独立的 QP/CQ/MR 与专属连接线程、字节级精确
+> 负载均衡、四重完整性校验、晚到写防护与资源背压，且**不改变对象与磁盘条带布局**，对现有接口完全向后兼容。
+>
+> - 快速上手与复现（无硬件 RoCE 也可跑）：[docs/multirail-quickstart-zh.md](docs/multirail-quickstart-zh.md)
+> - 设计文档：[docs/multirail-design-zh.md](docs/multirail-design-zh.md)
+> - 上游 PR（含逐文件改动说明）：https://github.com/DaoCloud/ContextStore/pull/28
+> - 测试床脚本（软 RDMA，一键 up/down）：[scripts/rxe-testbed-setup.sh](scripts/rxe-testbed-setup.sh)
+>
+> 实测：双轨 512MB×5 轮负载两轨各 1280 MiB 精确均衡、故障注入/版本一致 e2e 全通过、系统级双进程 1.81× 聚合提升。
+
 ContextStore extends the KV cache from a single node's GPU HBM out to host memory, local NVMe, and remote JBOF / NVMe-oF pools. It gives vLLM / Dynamo inference workers cross-instance, cross-session KV reuse so long-context and multi-replica deployments avoid repeating prefill on cache-warm prefixes.
 
 The repository is split into two independently built parts, plus a thin plugin layer:
