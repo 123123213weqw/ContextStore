@@ -8,6 +8,11 @@
 //! concatenating 480MB on the client side. Instead, the gRPC framework's inbound
 //! buffer view is handed straight to the caller.
 
+// tonic-build's generated client stubs return Result<_, tonic::Status>; newer
+// clippy versions flag the Status size on that generated code. The generated
+// file is vendored from the proto, so silence the lint crate-wide.
+#![allow(clippy::result_large_err)]
+
 pub mod pb {
     tonic::include_proto!("contextstore.kv.v1");
 }
@@ -18,6 +23,10 @@ pub mod pb {
 /// gRPC-only SDK build therefore has no libibverbs dependency.
 #[cfg(feature = "rdma")]
 pub mod rdma;
+
+/// Multi-rail RDMA read path: parallel stripe reads over several local HCAs.
+#[cfg(feature = "rdma")]
+pub mod multirail;
 
 use pb::kv_service_client::KvServiceClient;
 use prost::bytes::Bytes;
