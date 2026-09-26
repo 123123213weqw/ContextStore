@@ -49,6 +49,18 @@ struct Args {
     /// Stripe→rail policy: least-loaded | endpoint-affinity | rr
     #[arg(long, default_value = "least-loaded")]
     policy: String,
+    /// RC path MTU for all rails (bytes). 4096 on jumbo-frame fabrics.
+    #[arg(long, default_value = "1024")]
+    qp_mtu: u16,
+    /// Keep per-rail registrations cached across iterations (pinned-buffer
+    /// fast path; skips ~ibv_reg_mr of the whole buffer every read).
+    #[arg(long, default_value_t = false)]
+    sticky: bool,
+    /// Max stripes per task: splits an endpoint's stripes over several
+    /// connections per rail (intra-rail concurrency). 0 = one task per
+    /// (rail, endpoint).
+    #[arg(long, default_value = "0")]
+    task_max_stripes: usize,
     #[arg(long, default_value = "5")]
     iters: usize,
     /// Destination buffer size in MiB (>= object size).
@@ -190,6 +202,7 @@ fn run_client(
         .with_context(|| format!("unknown policy '{}'", args.policy))?;
     let limits = RailLimits {
         io_timeout: std::time::Duration::from_secs(args.io_timeout_secs),
+        task_max_stripes: args.task_max_stripes,
         ..RailLimits::default()
     };
     let client = MultiRailClient::new(rails)?.with_limits(limits).with_policy(policy);
@@ -214,9 +227,22 @@ fn run_client(
         // Poison the buffer so a missing stripe cannot slip through.
         buffer.as_mut().iter_mut().for_each(|b| *b = 0xA5);
         let started = Instant::now();
-        let bytes = client
-            .read_lookup_into(lookup, buffer.as_mut())
-            .with_context(|| format!("[{label}] iteration {iteration} failed"))?;
+        let bytes = if args.sticky {
+            // SAFETY: the AlignedBuffer outlives the client and is never
+            // freed or reused while reads run.
+            unsafe {
+                client.read_object_into_raw(
+                    &lookup.descriptor,
+                    &lookup.placement.as_ref().map(|p| p.chunks.clone()).unwrap_or_default(),
+                    buffer.ptr,
+                    buffer.len,
+                    true,
+                )
+            }
+        } else {
+            client.read_lookup_into(lookup, buffer.as_mut())
+        }
+        .with_context(|| format!("[{label}] iteration {iteration} failed"))?;
         latencies.push(started.elapsed());
         last_len = bytes;
         if bytes != object_size {
@@ -297,6 +323,9 @@ fn main() -> Result<()> {
             rail.map(|mut rail| {
                 if let Some(endpoints) = pins.get(&rail.device) {
                     rail.endpoints = endpoints.clone();
+                }
+                if args.qp_mtu != 1024 {
+                    rail.mtu = args.qp_mtu;
                 }
                 rail
             })

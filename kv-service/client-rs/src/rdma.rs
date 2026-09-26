@@ -65,6 +65,9 @@ pub struct RdmaClientConfig {
     pub io_timeout: Option<Duration>,
     /// Bound on the TCP connect phase itself.
     pub connect_timeout: Option<Duration>,
+    /// RC path MTU in bytes (512/1024/2048/4096). Must not exceed the network
+    /// MTU; jumbo-frame RoCE fabrics want 4096.
+    pub path_mtu: u16,
 }
 
 impl RdmaClientConfig {
@@ -77,6 +80,7 @@ impl RdmaClientConfig {
             gid_index: 3,
             io_timeout: None,
             connect_timeout: None,
+            path_mtu: 1024,
         }
     }
 
@@ -102,6 +106,22 @@ impl RdmaClientConfig {
     pub fn with_connect_timeout(mut self, timeout: Duration) -> Self {
         self.connect_timeout = Some(timeout);
         self
+    }
+
+    /// Set the RC path MTU in bytes (rounded down to 512/1024/2048/4096).
+    pub fn with_path_mtu(mut self, bytes: u16) -> Self {
+        self.path_mtu = bytes;
+        self
+    }
+}
+
+/// Map a byte count onto the closest supported RC path MTU.
+fn path_mtu_enum(bytes: u16) -> ibv_mtu::Type {
+    match bytes {
+        0..=512 => ibv_mtu::IBV_MTU_512,
+        513..=1024 => ibv_mtu::IBV_MTU_1024,
+        1025..=2048 => ibv_mtu::IBV_MTU_2048,
+        _ => ibv_mtu::IBV_MTU_4096,
     }
 }
 
@@ -411,7 +431,7 @@ impl RdmaClient {
             };
             write_hello(&mut stream, local)?;
             let remote = read_hello(&mut stream)?;
-            transition_qp_to_rtr(qp, &remote, config.port, config.gid_index)?;
+            transition_qp_to_rtr(qp, &remote, config.port, config.gid_index, config.path_mtu)?;
             transition_qp_to_rts(qp, local.psn)?;
             Ok(stream)
         })();
@@ -1103,11 +1123,12 @@ fn transition_qp_to_rtr(
     remote: &QpInfo,
     port: u8,
     gid_index: u8,
+    path_mtu_bytes: u16,
 ) -> Result<()> {
     unsafe {
         let mut attr: ibv_qp_attr = std::mem::zeroed();
         attr.qp_state = ibv_qp_state::IBV_QPS_RTR;
-        attr.path_mtu = ibv_mtu::IBV_MTU_1024;
+        attr.path_mtu = path_mtu_enum(path_mtu_bytes);
         attr.dest_qp_num = remote.qpn;
         attr.rq_psn = remote.psn;
         attr.max_dest_rd_atomic = 1;

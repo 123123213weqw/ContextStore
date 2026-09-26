@@ -89,6 +89,9 @@ pub struct RailConfig {
     pub gid_index: u8,
     /// Relative share of stripes this rail receives (load-balancing weight).
     pub weight: u32,
+    /// RC path MTU in bytes; 4096 on jumbo-frame fabrics, 1024 (default) on
+    /// standard 1500-byte networks.
+    pub mtu: u16,
     /// Optional endpoint whitelist (`host:port` or bare `host`). Empty means
     /// the rail may serve any endpoint. Rail-optimized fabrics pin rail k to
     /// fabric k; soft-RoCE cross-wired testbeds use it the same way.
@@ -102,6 +105,7 @@ impl RailConfig {
             port: 1,
             gid_index: 3,
             weight: 1,
+            mtu: 1024,
             endpoints: Vec::new(),
         }
     }
@@ -118,6 +122,12 @@ impl RailConfig {
 
     pub fn with_weight(mut self, weight: u32) -> Self {
         self.weight = weight.max(1);
+        self
+    }
+
+    /// Set the RC path MTU (bytes; 4096 for jumbo-frame fabrics).
+    pub fn with_mtu(mut self, bytes: u16) -> Self {
+        self.mtu = bytes;
         self
     }
 
@@ -139,7 +149,7 @@ impl RailConfig {
             .any(|allowed| allowed == endpoint || *allowed == host)
     }
 
-    /// Parse `device[:port[:gid[:weight]]]` (portions left out keep defaults).
+    /// Parse `device[:port[:gid[:weight[:mtu]]]]` (omitted parts keep defaults).
     pub fn parse(spec: &str) -> Option<Self> {
         let mut parts = spec.split(':');
         let device = parts.next()?.trim();
@@ -156,6 +166,9 @@ impl RailConfig {
         if let Some(weight) = parts.next().and_then(|w| w.trim().parse().ok()) {
             config = config.with_weight(weight);
         }
+        if let Some(mtu) = parts.next().and_then(|m| m.trim().parse().ok()) {
+            config = config.with_mtu(mtu);
+        }
         Some(config)
     }
 }
@@ -171,6 +184,10 @@ pub struct RailLimits {
     pub max_inflight_bytes_per_rail: u64,
     /// In-flight bytes across all rails before dispatch blocks.
     pub max_inflight_bytes_total: u64,
+    /// Cap on stripes per task: an endpoint's stripes assigned to one rail
+    /// are split into tasks of at most this many stripes, each on its own
+    /// connection (per-rail concurrency / queue depth). 0 = unlimited.
+    pub task_max_stripes: usize,
     /// Per-operation TCP control-channel timeout; also bounds connect.
     pub io_timeout: Duration,
     /// How long a failed rail is skipped before it is retried.
@@ -184,6 +201,7 @@ impl Default for RailLimits {
             max_connections_total: 32,
             max_inflight_bytes_per_rail: 8 * 1024 * 1024 * 1024u64,
             max_inflight_bytes_total: 32 * 1024 * 1024 * 1024u64,
+            task_max_stripes: 0,
             io_timeout: Duration::from_secs(30),
             rail_cooldown: DEFAULT_RAIL_COOLDOWN,
         }
@@ -740,10 +758,20 @@ fn pick_rail(
 /// then distribute each endpoint's stripes over the rails allowed to reach
 /// that endpoint, according to the policy, keeping one task per (rail,
 /// endpoint) pair so the byte count per task can be verified afterwards.
+/// Total bytes of one stripe batch according to the validated placement.
+fn stripe_batch_bytes(stripes: &[u32], placement: &ValidatedPlacement) -> u64 {
+    stripes
+        .iter()
+        .filter_map(|stripe| placement.stripes.get(stripe))
+        .map(|info| info.length)
+        .sum()
+}
+
 fn build_plan(
     placement: &ValidatedPlacement,
     rails: &[Arc<Rail>],
     policy: RailSelectPolicy,
+    limits: &RailLimits,
 ) -> Result<ReadPlan, MultiRailError> {
     // Group stripes by endpoint first.
     let mut by_endpoint: BTreeMap<Arc<str>, Vec<(u32, u64)>> = BTreeMap::new();
@@ -792,18 +820,27 @@ fn build_plan(
                     bytes_per_rail[rail] += length;
                     assigned[rail] += length;
                 }
-                for (rail_index, (stripe_list, bytes)) in
+                for (rail_index, (stripe_list, _bytes)) in
                     per_rail.into_iter().zip(bytes_per_rail).enumerate()
                 {
                     if stripe_list.is_empty() {
                         continue;
                     }
-                    tasks.push(TaskSpec {
-                        rail_index,
-                        endpoint: Arc::clone(&endpoint),
-                        stripes: stripe_list,
-                        bytes,
-                    });
+                    // Split into per-connection batches for intra-rail
+                    // concurrency (bounded queue depth per rail).
+                    let batch = if limits.task_max_stripes == 0 {
+                        stripe_list.len()
+                    } else {
+                        limits.task_max_stripes.max(1)
+                    };
+                    for chunk in stripe_list.chunks(batch) {
+                        tasks.push(TaskSpec {
+                            rail_index,
+                            endpoint: Arc::clone(&endpoint),
+                            stripes: chunk.to_vec(),
+                            bytes: stripe_batch_bytes(chunk, placement),
+                        });
+                    }
                 }
             }
             // Pin the whole endpoint to one allowed rail.
@@ -1211,7 +1248,7 @@ impl MultiRailClient {
             .map(|rail| (rail.index, Arc::clone(rail)))
             .collect();
 
-        let plan = build_plan(&placement, &rails, self.policy)?;
+        let plan = build_plan(&placement, &rails, self.policy, &self.limits)?;
         let waves = plan_waves(plan.tasks, &self.limits);
 
         // Global deadline: every wave gets a full io_timeout, plus one extra
@@ -1671,11 +1708,12 @@ mod tests {
     #[test]
     fn rail_config_parses_optional_fields() {
         assert_eq!(RailConfig::parse("mlx5_0").unwrap().port, 1);
-        let full = RailConfig::parse("irdma0:1:5:2").unwrap();
+        let full = RailConfig::parse("irdma0:1:5:2:4096").unwrap();
         assert_eq!(full.device, "irdma0");
         assert_eq!(full.port, 1);
         assert_eq!(full.gid_index, 5);
         assert_eq!(full.weight, 2);
+        assert_eq!(full.mtu, 4096);
         assert!(RailConfig::parse("  ").is_none());
     }
 
@@ -1747,7 +1785,7 @@ mod tests {
         let chunks: Vec<_> = (0..8).map(|i| chunk(i, "10.0.0.1", 8, "")).collect();
         let placement = validate_placement(&desc, &chunks).unwrap();
         let rails = test_rails(2);
-        let plan = build_plan(&placement, &rails, RailSelectPolicy::LeastLoaded).unwrap();
+        let plan = build_plan(&placement, &rails, RailSelectPolicy::LeastLoaded, &RailLimits::default()).unwrap();
         assert_eq!(plan.task_count(), 2);
         let total: u64 = plan.tasks.iter().map(|t| t.bytes).sum();
         assert_eq!(total, 64);
@@ -1781,7 +1819,7 @@ mod tests {
             unhealthy_until: Mutex::new(None),
             gid_v4: None,
         });
-        let plan = build_plan(&placement, &rails, RailSelectPolicy::LeastLoaded).unwrap();
+        let plan = build_plan(&placement, &rails, RailSelectPolicy::LeastLoaded, &RailLimits::default()).unwrap();
         let rail0: u64 = plan
             .tasks
             .iter()
@@ -1814,7 +1852,7 @@ mod tests {
             gid_v4: None,
         });
         let plan =
-            build_plan(&placement, &rails, RailSelectPolicy::LeastLoaded).expect("plan builds");
+            build_plan(&placement, &rails, RailSelectPolicy::LeastLoaded, &RailLimits::default()).expect("plan builds");
         // dev0 pinned to 10.0.0.2; 10.0.0.1 falls to dev1.
         assert_eq!(plan.tasks.len(), 2);
         for task in &plan.tasks {
@@ -1832,7 +1870,7 @@ mod tests {
             unhealthy_until: Mutex::new(None),
             gid_v4: None,
         });
-        assert!(build_plan(&placement, &strict, RailSelectPolicy::LeastLoaded).is_err());
+        assert!(build_plan(&placement, &strict, RailSelectPolicy::LeastLoaded, &RailLimits::default()).is_err());
     }
 
     #[test]
@@ -1841,7 +1879,7 @@ mod tests {
         let chunks: Vec<_> = (0..8).map(|i| chunk(i, "10.0.0.1", 8, "")).collect();
         let placement = validate_placement(&desc, &chunks).unwrap();
         let rails = test_rails(2);
-        let plan = build_plan(&placement, &rails, RailSelectPolicy::EndpointAffinity).unwrap();
+        let plan = build_plan(&placement, &rails, RailSelectPolicy::EndpointAffinity, &RailLimits::default()).unwrap();
         assert_eq!(plan.task_count(), 1);
         assert_eq!(plan.tasks[0].bytes, 64);
         assert_eq!(plan.tasks[0].stripes.len(), 8);
@@ -1862,7 +1900,7 @@ mod tests {
             unhealthy_until: Mutex::new(None),
             gid_v4: Some("10.0.0.5".parse().unwrap()),
         });
-        let plan = build_plan(&placement, &rails, RailSelectPolicy::EndpointAffinity).unwrap();
+        let plan = build_plan(&placement, &rails, RailSelectPolicy::EndpointAffinity, &RailLimits::default()).unwrap();
         assert_eq!(plan.tasks.len(), 1);
         assert_eq!(plan.tasks[0].rail_index, 1);
     }

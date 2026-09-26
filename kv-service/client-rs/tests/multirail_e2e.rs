@@ -31,6 +31,11 @@ fn rails_from_env() -> Vec<RailConfig> {
             if let Some(endpoints) = pins.get(&rail.device) {
                 rail.endpoints = endpoints.clone();
             }
+            if let Ok(mtu) = std::env::var("CS_MR_RAIL_MTU") {
+                if let Ok(mtu) = mtu.trim().parse::<u16>() {
+                    rail.mtu = mtu;
+                }
+            }
             rail
         })
         .collect()
@@ -162,9 +167,16 @@ fn seed(namespace: &str, key: &str, size_mb: usize) -> Fixture {
 }
 
 fn limits() -> RailLimits {
+    // CS_MR_TASK_MAX_STRIPES > 0 exercises the intra-rail task split (several
+    // connections per rail) in addition to the plain per-endpoint layout.
+    let task_max_stripes = std::env::var("CS_MR_TASK_MAX_STRIPES")
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .unwrap_or(0);
     RailLimits {
         io_timeout: Duration::from_secs(20),
         rail_cooldown: Duration::from_millis(500),
+        task_max_stripes,
         ..RailLimits::default()
     }
 }

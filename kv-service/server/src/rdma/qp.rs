@@ -134,11 +134,17 @@ impl RcQp {
     }
 
     /// Transition to RTR (Ready-To-Receive). Requires remote QP info + path MTU + GID index.
-    pub fn to_rtr(&self, remote: &QpInfo, port_num: u8, gid_index: u8) -> Result<()> {
+    pub fn to_rtr(
+        &self,
+        remote: &QpInfo,
+        port_num: u8,
+        gid_index: u8,
+        path_mtu: ibv_mtu::Type,
+    ) -> Result<()> {
         unsafe {
             let mut attr: ibv_qp_attr = std::mem::zeroed();
             attr.qp_state = ibv_qp_state::IBV_QPS_RTR;
-            attr.path_mtu = ibv_mtu::IBV_MTU_1024; // align with hardware active_mtu
+            attr.path_mtu = path_mtu; // align with hardware/network MTU
             attr.dest_qp_num = remote.qpn;
             attr.rq_psn = remote.psn;
             attr.max_dest_rd_atomic = 1;
