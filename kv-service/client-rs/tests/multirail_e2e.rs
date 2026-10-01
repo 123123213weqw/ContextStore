@@ -47,6 +47,7 @@ fn unpinned(rails: &[RailConfig]) -> Vec<RailConfig> {
         .cloned()
         .map(|mut rail| {
             rail.endpoints.clear();
+            rail.endpoint_routes.clear();
             rail
         })
         .collect()
@@ -70,22 +71,34 @@ fn pin_map_from_env() -> std::collections::HashMap<String, Vec<String>> {
     map
 }
 
-/// Rewrite the placement's per-stripe RDMA endpoints round-robin across
-/// `CS_MR_ALTERNATE_ENDPOINTS` (comma-separated `host:port` list). Used on
-/// single-host testbeds where one node owns several NIC listeners.
-fn remap_lookup_endpoints(lookup: &ObjectLookup) -> ObjectLookup {
+/// Resolve the one endpoint advertised by a node to its independent listeners.
+/// The placement is kept exactly as returned by LookupObject.
+fn routed_rails(lookup: &ObjectLookup) -> Vec<RailConfig> {
+    let mut rails = rails_from_env();
     let list = env_or("CS_MR_ALTERNATE_ENDPOINTS", "");
     if list.is_empty() {
-        return lookup.clone();
+        return rails;
     }
-    let endpoints: Vec<String> = list.split(',').map(|s| s.trim().to_string()).collect();
-    let mut remapped = lookup.clone();
-    if let Some(placement) = remapped.placement.as_mut() {
-        for (index, chunk) in placement.chunks.iter_mut().enumerate() {
-            chunk.rdma_endpoint = endpoints[index % endpoints.len()].clone();
-        }
+    let advertised = &lookup
+        .placement
+        .as_ref()
+        .expect("placement")
+        .chunks
+        .first()
+        .expect("placement chunk")
+        .rdma_endpoint;
+    let endpoints: Vec<_> = list.split(',').map(str::trim).collect();
+    assert_eq!(
+        rails.len(),
+        endpoints.len(),
+        "one listener per rail is required"
+    );
+    for (rail, listener) in rails.iter_mut().zip(endpoints) {
+        rail.endpoint_routes.clear();
+        rail.endpoint_routes
+            .push((advertised.clone(), listener.to_string()));
     }
-    remapped
+    rails
 }
 
 fn unique_key(prefix: &str) -> String {
@@ -186,9 +199,8 @@ fn multirail_read_returns_identical_bytes_across_rail_counts() {
         fixture.lookup.placement.is_some(),
         "lookup returned no placement"
     );
-    let rails = rails_from_env();
+    let rails = routed_rails(&fixture.lookup);
     assert!(rails.len() >= 2, "CS_MR_RAILS must list at least two rails");
-    let lookup = remap_lookup_endpoints(&fixture.lookup);
 
     // Dual-rail read.
     let dual = MultiRailClient::new(rails.clone())
@@ -196,7 +208,7 @@ fn multirail_read_returns_identical_bytes_across_rail_counts() {
         .with_limits(limits());
     let mut buffer = vec![0xA5u8; fixture.size];
     let bytes = dual
-        .read_lookup_into(&lookup, &mut buffer)
+        .read_lookup_into(&fixture.lookup, &mut buffer)
         .expect("dual-rail read");
     assert_eq!(bytes, fixture.size);
     assert!(verify_pattern(&buffer), "dual-rail content mismatch");
@@ -211,8 +223,7 @@ fn multirail_read_returns_identical_bytes_across_rail_counts() {
 
     // Single-rail read of the same object must match byte-for-byte
     // (compatibility: the safe-API buffer is reused across clients). On
-    // cross-wired testbeds a lone rail may only reach its own-side listener,
-    // so the reference reads the original (un-remapped) placement.
+    // cross-wired testbeds a lone rail may only reach its own-side listener.
     let single = MultiRailClient::new(unpinned(&rails[..1]))
         .expect("create single-rail client")
         .with_limits(limits());
@@ -228,7 +239,7 @@ fn multirail_read_returns_identical_bytes_across_rail_counts() {
 #[ignore = "requires an RDMA-enabled ContextStore server with 2+ listeners"]
 fn rail_failure_fails_safely_and_next_read_recovers() {
     let fixture = seed("multirail-e2e", &unique_key("fail"), 128);
-    let rails = rails_from_env();
+    let rails = routed_rails(&fixture.lookup);
     let dead_endpoint = env_or("CS_MR_DEAD_ENDPOINT", "127.0.0.1:59999");
 
     // Sabotage the placement: point every stripe at a dead endpoint. The
@@ -267,7 +278,7 @@ fn rail_failure_fails_safely_and_next_read_recovers() {
         .expect("create recovery client")
         .with_limits(limits());
     let bytes = recovered
-        .read_lookup_into(&remap_lookup_endpoints(&fixture.lookup), &mut buffer)
+        .read_lookup_into(&fixture.lookup, &mut buffer)
         .expect("recovery read after failure");
     assert_eq!(bytes, fixture.size);
     assert!(verify_pattern(&buffer), "recovered content mismatch");
@@ -297,11 +308,11 @@ fn stale_descriptor_is_reported_as_relookup() {
             .expect("rewrite object");
     });
 
-    let client = MultiRailClient::new(rails_from_env())
+    let client = MultiRailClient::new(routed_rails(&fixture.lookup))
         .expect("create client")
         .with_limits(limits());
     let mut buffer = vec![0u8; fixture.size];
-    match client.read_lookup_into(&remap_lookup_endpoints(&fixture.lookup), &mut buffer) {
+    match client.read_lookup_into(&fixture.lookup, &mut buffer) {
         Err(MultiRailError::StaleDescriptor { .. }) => {}
         other => panic!("expected StaleDescriptor, got {other:?}"),
     }

@@ -98,6 +98,9 @@ pub struct RailConfig {
     /// the rail may serve any endpoint. Rail-optimized fabrics pin rail k to
     /// fabric k; soft-RoCE cross-wired testbeds use it the same way.
     pub endpoints: Vec<String>,
+    /// Explicit advertised-endpoint to listener routes. A node may advertise
+    /// one primary endpoint while exposing a different listener on each NIC.
+    pub endpoint_routes: Vec<(String, String)>,
 }
 
 impl RailConfig {
@@ -110,6 +113,7 @@ impl RailConfig {
             mtu: 1024,
             hop_limit: 1,
             endpoints: Vec::new(),
+            endpoint_routes: Vec::new(),
         }
     }
 
@@ -146,11 +150,41 @@ impl RailConfig {
         self
     }
 
+    /// Map the endpoint returned by placement lookup to this rail's listener.
+    pub fn with_endpoint_route(
+        mut self,
+        advertised: impl Into<String>,
+        listener: impl Into<String>,
+    ) -> Self {
+        self.endpoint_routes
+            .push((advertised.into(), listener.into()));
+        self
+    }
+
+    /// Resolve a placement endpoint to the listener reachable over this rail.
+    fn route_endpoint<'a>(&'a self, advertised: &'a str) -> Option<&'a str> {
+        if let Some((_, listener)) = self
+            .endpoint_routes
+            .iter()
+            .find(|(source, _)| source == advertised)
+        {
+            return Some(listener);
+        }
+        self.allows_endpoint(advertised).then_some(advertised)
+    }
+
     /// Whether this rail may serve `endpoint` (exact `host:port` or host-only
     /// match; an empty whitelist allows everything).
     fn allows_endpoint(&self, endpoint: &str) -> bool {
-        if self.endpoints.is_empty() {
+        if self
+            .endpoint_routes
+            .iter()
+            .any(|(source, _)| source == endpoint)
+        {
             return true;
+        }
+        if self.endpoints.is_empty() {
+            return self.endpoint_routes.is_empty();
         }
         let host = endpoint
             .rsplit_once(':')
@@ -162,20 +196,32 @@ impl RailConfig {
     }
 
     /// Parse `device[:port[:gid[:weight[:mtu]]]][@ep[;ep...]]` (omitted
-    /// parts keep defaults). The optional `@` suffix pins the rail to an
-    /// endpoint whitelist (`host:port` or bare host, `;`-separated).
+    /// parts keep defaults). An `@` item is either an endpoint whitelist entry
+    /// or `advertised->listener`, a static route to another NIC on that node.
     pub fn parse(spec: &str) -> Option<Self> {
-        let (spec, endpoints) = match spec.split_once('@') {
-            Some((left, right)) => (
-                left,
-                right
-                    .split(';')
-                    .map(|ep| ep.trim().to_string())
-                    .filter(|ep| !ep.is_empty())
-                    .collect::<Vec<_>>(),
-            ),
-            None => (spec, Vec::new()),
-        };
+        let (spec, endpoint_spec) = spec.split_once('@').unwrap_or((spec, ""));
+        let mut endpoints = Vec::new();
+        let mut endpoint_routes = Vec::new();
+        for item in endpoint_spec
+            .split(';')
+            .map(str::trim)
+            .filter(|item| !item.is_empty())
+        {
+            if let Some((source, listener)) = item.split_once("->") {
+                let (source, listener) = (source.trim(), listener.trim());
+                if source.is_empty()
+                    || listener.is_empty()
+                    || endpoint_routes
+                        .iter()
+                        .any(|(existing, _)| existing == source)
+                {
+                    return None;
+                }
+                endpoint_routes.push((source.to_string(), listener.to_string()));
+            } else {
+                endpoints.push(item.to_string());
+            }
+        }
         let mut parts = spec.split(':');
         let device = parts.next()?.trim();
         if device.is_empty() {
@@ -197,6 +243,7 @@ impl RailConfig {
         if !endpoints.is_empty() {
             config = config.with_endpoints(endpoints);
         }
+        config.endpoint_routes = endpoint_routes;
         Some(config)
     }
 }
@@ -212,6 +259,12 @@ pub struct RailLimits {
     pub max_inflight_bytes_per_rail: u64,
     /// In-flight bytes across all rails before dispatch blocks.
     pub max_inflight_bytes_total: u64,
+    /// Total bytes reserved for private, failure-atomic receive buffers.
+    pub max_staging_bytes_total: u64,
+    /// Registered receive bytes reserved across all participating QPs.
+    pub max_registered_bytes_total: u64,
+    /// Registered receive bytes reserved on one local Rail.
+    pub max_registered_bytes_per_rail: u64,
     /// Cap on stripes per task: an endpoint's stripes assigned to one rail
     /// are split into tasks of at most this many stripes, each on its own
     /// connection (per-rail concurrency / queue depth). 0 = unlimited.
@@ -229,6 +282,9 @@ impl Default for RailLimits {
             max_connections_total: 32,
             max_inflight_bytes_per_rail: 8 * 1024 * 1024 * 1024u64,
             max_inflight_bytes_total: 32 * 1024 * 1024 * 1024u64,
+            max_staging_bytes_total: 4 * 1024 * 1024 * 1024u64,
+            max_registered_bytes_total: 16 * 1024 * 1024 * 1024u64,
+            max_registered_bytes_per_rail: 8 * 1024 * 1024 * 1024u64,
             task_max_stripes: 0,
             io_timeout: Duration::from_secs(30),
             rail_cooldown: DEFAULT_RAIL_COOLDOWN,
@@ -276,6 +332,11 @@ pub enum MultiRailError {
     BufferTooSmall {
         need: u64,
         have: usize,
+    },
+    ResourceExhausted {
+        resource: &'static str,
+        requested: u64,
+        limit: u64,
     },
     InvalidPlacement(String),
     MissingStripes(Vec<u32>),
@@ -329,6 +390,14 @@ impl fmt::Display for MultiRailError {
             Self::BufferTooSmall { need, have } => write!(
                 f,
                 "destination buffer too small: need {need} bytes, have {have}"
+            ),
+            Self::ResourceExhausted {
+                resource,
+                requested,
+                limit,
+            } => write!(
+                f,
+                "{resource} budget exceeded: requested {requested} bytes with limit {limit} bytes"
             ),
             Self::InvalidPlacement(reason) => write!(f, "invalid placement: {reason}"),
             Self::MissingStripes(stripes) => {
@@ -740,8 +809,17 @@ fn validate_placement(
 struct TaskSpec {
     rail_index: usize,
     endpoint: Arc<str>,
+    connection_lane: usize,
     stripes: Vec<u32>,
     bytes: u64,
+}
+
+type ConnKey = (usize, Arc<str>, usize);
+
+#[derive(Clone, Copy)]
+struct ReadTarget {
+    base: usize,
+    len: usize,
 }
 
 /// The planned distribution of a read across rails.
@@ -828,22 +906,27 @@ fn pick_rail(
             candidates[0]
         }
         RailSelectPolicy::EndpointAffinity => {
-            // Prefer rails on the same /24 as the endpoint, then the least
-            // loaded relative to weight.
+            // Prefer rails on the same /24 as their actual listener. A rail
+            // route may lead to a different fabric than the advertised IP.
             let mut shortlist: Vec<usize> = candidates.to_vec();
-            if let Some(ip) = endpoint_v4(endpoint) {
-                let matched: Vec<usize> = candidates
-                    .iter()
-                    .copied()
-                    .filter(|&index| {
-                        rails[index]
-                            .gid_v4
-                            .is_some_and(|rail_ip| rail_ip.octets()[..3] == ip.octets()[..3])
-                    })
-                    .collect();
-                if !matched.is_empty() {
-                    shortlist = matched;
-                }
+            let matched: Vec<usize> = candidates
+                .iter()
+                .copied()
+                .filter(|&index| {
+                    let target = rails[index]
+                        .config
+                        .route_endpoint(endpoint)
+                        .unwrap_or(endpoint);
+                    match (rails[index].gid_v4, endpoint_v4(target)) {
+                        (Some(rail_ip), Some(target_ip)) => {
+                            rail_ip.octets()[..3] == target_ip.octets()[..3]
+                        }
+                        _ => false,
+                    }
+                })
+                .collect();
+            if !matched.is_empty() {
+                shortlist = matched;
             }
             least_loaded(&shortlist, rails, assigned)
         }
@@ -886,7 +969,7 @@ fn build_plan(
         let candidates: Vec<usize> = rails
             .iter()
             .enumerate()
-            .filter(|(_, rail)| rail.config.allows_endpoint(&endpoint))
+            .filter(|(_, rail)| rail.config.route_endpoint(&endpoint).is_some())
             .map(|(index, _)| index)
             .collect();
         if candidates.is_empty() {
@@ -902,7 +985,13 @@ fn build_plan(
             _ if !placement.is_striped => {
                 tasks.push(TaskSpec {
                     rail_index: candidates[0],
-                    endpoint,
+                    endpoint: Arc::from(
+                        rails[candidates[0]]
+                            .config
+                            .route_endpoint(&endpoint)
+                            .expect("candidate rail has a route"),
+                    ),
+                    connection_lane: 0,
                     stripes: Vec::new(),
                     bytes: placement.expected_bytes,
                 });
@@ -930,10 +1019,16 @@ fn build_plan(
                     } else {
                         limits.task_max_stripes.max(1)
                     };
-                    for chunk in stripe_list.chunks(batch) {
+                    for (connection_lane, chunk) in stripe_list.chunks(batch).enumerate() {
                         tasks.push(TaskSpec {
                             rail_index,
-                            endpoint: Arc::clone(&endpoint),
+                            endpoint: Arc::from(
+                                rails[rail_index]
+                                    .config
+                                    .route_endpoint(&endpoint)
+                                    .expect("candidate rail has a route"),
+                            ),
+                            connection_lane,
                             stripes: chunk.to_vec(),
                             bytes: stripe_batch_bytes(chunk, placement),
                         });
@@ -947,7 +1042,13 @@ fn build_plan(
                 assigned[rail] += bytes;
                 tasks.push(TaskSpec {
                     rail_index: rail,
-                    endpoint,
+                    endpoint: Arc::from(
+                        rails[rail]
+                            .config
+                            .route_endpoint(&endpoint)
+                            .expect("candidate rail has a route"),
+                    ),
+                    connection_lane: 0,
                     stripes: stripes.into_iter().map(|(stripe, _)| stripe).collect(),
                     bytes,
                 });
@@ -962,22 +1063,35 @@ fn build_plan(
     })
 }
 
-/// Group tasks into dispatch waves that respect the connection caps. Tasks
-/// never share a (rail, endpoint) pair within one plan, so every task in a
-/// wave is a distinct connection.
+/// Group tasks into dispatch waves that respect connection and byte caps.
+/// Split batches use distinct connection lanes, so a wave can overlap them.
 fn plan_waves(tasks: Vec<TaskSpec>, limits: &RailLimits) -> Vec<Vec<TaskSpec>> {
     let mut waves: Vec<Vec<TaskSpec>> = Vec::new();
     let mut current: Vec<TaskSpec> = Vec::new();
     let mut rail_conns: HashMap<usize, usize> = HashMap::new();
+    let mut rail_bytes: HashMap<usize, u64> = HashMap::new();
+    let mut total_bytes = 0u64;
     for task in tasks {
         let rail_ok = rail_conns.get(&task.rail_index).copied().unwrap_or(0)
             < limits.max_connections_per_rail.max(1);
         let total_ok = current.len() < limits.max_connections_total.max(1);
-        if !rail_ok || !total_ok {
+        let rail_byte_ok = rail_bytes
+            .get(&task.rail_index)
+            .copied()
+            .unwrap_or(0)
+            .saturating_add(task.bytes)
+            <= limits.max_inflight_bytes_per_rail;
+        let total_byte_ok =
+            total_bytes.saturating_add(task.bytes) <= limits.max_inflight_bytes_total;
+        if !current.is_empty() && (!rail_ok || !total_ok || !rail_byte_ok || !total_byte_ok) {
             waves.push(std::mem::take(&mut current));
             rail_conns.clear();
+            rail_bytes.clear();
+            total_bytes = 0;
         }
         *rail_conns.entry(task.rail_index).or_insert(0) += 1;
+        *rail_bytes.entry(task.rail_index).or_insert(0) += task.bytes;
+        total_bytes += task.bytes;
         current.push(task);
     }
     if !current.is_empty() {
@@ -1194,7 +1308,39 @@ pub struct MultiRailClient {
     rails: Vec<Arc<Rail>>,
     limits: RailLimits,
     policy: RailSelectPolicy,
-    conns: Mutex<HashMap<(usize, Arc<str>), ConnEntry>>,
+    conns: Mutex<HashMap<ConnKey, ConnEntry>>,
+    admission: Mutex<()>,
+    staging_bytes: AtomicU64,
+    registered_reserved_total: AtomicU64,
+    registered_reserved_per_rail: Vec<AtomicU64>,
+}
+
+struct StagingReservation<'a> {
+    counter: &'a AtomicU64,
+    bytes: u64,
+}
+
+impl Drop for StagingReservation<'_> {
+    fn drop(&mut self) {
+        self.counter.fetch_sub(self.bytes, Ordering::AcqRel);
+    }
+}
+
+struct RegistrationReservation<'a> {
+    client: &'a MultiRailClient,
+    total: u64,
+    per_rail: Vec<(usize, u64)>,
+}
+
+impl Drop for RegistrationReservation<'_> {
+    fn drop(&mut self) {
+        self.client
+            .registered_reserved_total
+            .fetch_sub(self.total, Ordering::AcqRel);
+        for (index, bytes) in &self.per_rail {
+            self.client.registered_reserved_per_rail[*index].fetch_sub(*bytes, Ordering::AcqRel);
+        }
+    }
 }
 
 impl MultiRailClient {
@@ -1203,7 +1349,7 @@ impl MultiRailClient {
         if rails.is_empty() {
             return Err(MultiRailError::NoRails);
         }
-        let rails = rails
+        let rails: Vec<_> = rails
             .into_iter()
             .enumerate()
             .map(|(index, config)| {
@@ -1221,11 +1367,16 @@ impl MultiRailClient {
                 })
             })
             .collect();
+        let registered_reserved_per_rail = (0..rails.len()).map(|_| AtomicU64::new(0)).collect();
         Ok(Self {
             rails,
             limits: RailLimits::default(),
             policy: RailSelectPolicy::default(),
             conns: Mutex::new(HashMap::new()),
+            admission: Mutex::new(()),
+            staging_bytes: AtomicU64::new(0),
+            registered_reserved_total: AtomicU64::new(0),
+            registered_reserved_per_rail,
         })
     }
 
@@ -1247,6 +1398,109 @@ impl MultiRailClient {
 
     pub fn limits(&self) -> &RailLimits {
         &self.limits
+    }
+
+    /// Bytes currently reserved by private receive buffers across reads.
+    pub fn staging_bytes_inflight(&self) -> u64 {
+        self.staging_bytes.load(Ordering::Acquire)
+    }
+
+    /// Receive-registration bytes reserved by active reads.
+    pub fn registered_bytes_reserved(&self) -> u64 {
+        self.registered_reserved_total.load(Ordering::Acquire)
+    }
+
+    fn reserve_registration(
+        &self,
+        plan: &ReadPlan,
+        buffer_len: usize,
+    ) -> Result<RegistrationReservation<'_>, MultiRailError> {
+        let mut counts = vec![0u64; self.rails.len()];
+        for task in &plan.tasks {
+            counts[task.rail_index] += 1;
+        }
+        let mut per_rail = Vec::new();
+        let mut total = 0u64;
+        for (index, count) in counts.into_iter().enumerate() {
+            if count == 0 {
+                continue;
+            }
+            let bytes =
+                count
+                    .checked_mul(buffer_len as u64)
+                    .ok_or(MultiRailError::ResourceExhausted {
+                        resource: "registered_total",
+                        requested: u64::MAX,
+                        limit: self.limits.max_registered_bytes_total,
+                    })?;
+            total = total
+                .checked_add(bytes)
+                .ok_or(MultiRailError::ResourceExhausted {
+                    resource: "registered_total",
+                    requested: u64::MAX,
+                    limit: self.limits.max_registered_bytes_total,
+                })?;
+            per_rail.push((index, bytes));
+        }
+        let _admission = self.admission.lock().unwrap();
+        let used_total = self.registered_reserved_total.load(Ordering::Relaxed);
+        if used_total.saturating_add(total) > self.limits.max_registered_bytes_total {
+            return Err(MultiRailError::ResourceExhausted {
+                resource: "registered_total",
+                requested: total,
+                limit: self.limits.max_registered_bytes_total,
+            });
+        }
+        for (index, bytes) in &per_rail {
+            let used = self.registered_reserved_per_rail[*index].load(Ordering::Relaxed);
+            if used.saturating_add(*bytes) > self.limits.max_registered_bytes_per_rail {
+                return Err(MultiRailError::ResourceExhausted {
+                    resource: "registered_per_rail",
+                    requested: *bytes,
+                    limit: self.limits.max_registered_bytes_per_rail,
+                });
+            }
+        }
+        self.registered_reserved_total
+            .fetch_add(total, Ordering::Relaxed);
+        for (index, bytes) in &per_rail {
+            self.registered_reserved_per_rail[*index].fetch_add(*bytes, Ordering::Relaxed);
+        }
+        Ok(RegistrationReservation {
+            client: self,
+            total,
+            per_rail,
+        })
+    }
+
+    fn reserve_staging(&self, bytes: u64) -> Result<StagingReservation<'_>, MultiRailError> {
+        loop {
+            let current = self.staging_bytes.load(Ordering::Acquire);
+            let next = current
+                .checked_add(bytes)
+                .ok_or(MultiRailError::ResourceExhausted {
+                    resource: "staging",
+                    requested: bytes,
+                    limit: self.limits.max_staging_bytes_total,
+                })?;
+            if next > self.limits.max_staging_bytes_total {
+                return Err(MultiRailError::ResourceExhausted {
+                    resource: "staging",
+                    requested: bytes,
+                    limit: self.limits.max_staging_bytes_total,
+                });
+            }
+            if self
+                .staging_bytes
+                .compare_exchange(current, next, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                return Ok(StagingReservation {
+                    counter: &self.staging_bytes,
+                    bytes,
+                });
+            }
+        }
     }
 
     /// Snapshot of per-rail state for observability (health, throughput,
@@ -1299,8 +1553,7 @@ impl MultiRailClient {
         chunks: &[pb::PlacementChunk],
         buffer: &mut [u8],
     ) -> Result<usize, MultiRailError> {
-        let base = buffer.as_mut_ptr() as usize;
-        self.read_impl(descriptor, chunks, base, buffer.len(), false, None)
+        self.read_into_atomic(descriptor, chunks, buffer, None)
     }
 
     /// [`Self::read_object_into`] with cooperative cancellation.
@@ -1311,8 +1564,48 @@ impl MultiRailClient {
         buffer: &mut [u8],
         cancel: &CancelToken,
     ) -> Result<usize, MultiRailError> {
-        let base = buffer.as_mut_ptr() as usize;
-        self.read_impl(descriptor, chunks, base, buffer.len(), false, Some(cancel))
+        self.read_into_atomic(descriptor, chunks, buffer, Some(cancel))
+    }
+
+    /// Keep the caller's destination unchanged until every rail and checksum
+    /// has passed. The registered staging allocation remains live until all
+    /// participating connections have either replied or been quiesced.
+    fn read_into_atomic(
+        &self,
+        descriptor: &pb::ObjectDescriptor,
+        chunks: &[pb::PlacementChunk],
+        buffer: &mut [u8],
+        cancel: Option<&CancelToken>,
+    ) -> Result<usize, MultiRailError> {
+        let size =
+            usize::try_from(descriptor.size).map_err(|_| MultiRailError::BufferTooSmall {
+                need: descriptor.size,
+                have: buffer.len(),
+            })?;
+        if buffer.len() < size {
+            return Err(MultiRailError::BufferTooSmall {
+                need: descriptor.size,
+                have: buffer.len(),
+            });
+        }
+        let _reservation = self.reserve_staging(descriptor.size)?;
+        let mut staging = Vec::new();
+        staging.try_reserve_exact(size).map_err(|error| {
+            MultiRailError::InvalidPlacement(format!(
+                "cannot reserve {size} staging bytes: {error}"
+            ))
+        })?;
+        staging.resize(size, 0u8);
+        let bytes = self.read_impl(
+            descriptor,
+            chunks,
+            staging.as_mut_ptr() as usize,
+            staging.len(),
+            false,
+            cancel,
+        )?;
+        buffer[..bytes].copy_from_slice(&staging[..bytes]);
+        Ok(bytes)
     }
 
     /// Convenience wrapper taking a gRPC [`crate::ObjectLookup`] result.
@@ -1370,6 +1663,41 @@ impl MultiRailClient {
         sticky: bool,
         cancel: Option<&CancelToken>,
     ) -> Result<usize, MultiRailError> {
+        let mut participated: HashSet<ConnKey> = HashSet::new();
+        let mut registration = None;
+        // Every normal exit, including cancellation and integrity failures,
+        // must release a non-sticky registration before its buffer can drop.
+        let result = self.read_impl_inner(
+            descriptor,
+            chunks,
+            ReadTarget { base, len },
+            cancel,
+            &mut participated,
+            &mut registration,
+        );
+        let cleanup = if sticky {
+            Ok(())
+        } else {
+            self.evict_nonsticky(&participated, base)
+        };
+        drop(registration);
+        match (result, cleanup) {
+            (Err(error), _) => Err(error),
+            (Ok(_), Err(error)) => Err(error),
+            (Ok(bytes), Ok(())) => Ok(bytes),
+        }
+    }
+
+    fn read_impl_inner<'a>(
+        &'a self,
+        descriptor: &pb::ObjectDescriptor,
+        chunks: &[pb::PlacementChunk],
+        target: ReadTarget,
+        cancel: Option<&CancelToken>,
+        participated: &mut HashSet<ConnKey>,
+        registration: &mut Option<RegistrationReservation<'a>>,
+    ) -> Result<usize, MultiRailError> {
+        let ReadTarget { base, len } = target;
         let placement = validate_placement(descriptor, chunks)?;
         if placement.object_size > len as u64 {
             return Err(MultiRailError::BufferTooSmall {
@@ -1394,6 +1722,20 @@ impl MultiRailClient {
             .collect();
 
         let plan = build_plan(&placement, &rails, self.policy, &self.limits)?;
+        for task in &plan.tasks {
+            let limit = self
+                .limits
+                .max_inflight_bytes_per_rail
+                .min(self.limits.max_inflight_bytes_total);
+            if task.bytes > limit {
+                return Err(MultiRailError::ResourceExhausted {
+                    resource: "inflight_task",
+                    requested: task.bytes,
+                    limit,
+                });
+            }
+        }
+        *registration = Some(self.reserve_registration(&plan, len)?);
         let waves = plan_waves(plan.tasks, &self.limits);
 
         // Global deadline: every wave gets a full io_timeout, plus one extra
@@ -1404,7 +1746,6 @@ impl MultiRailClient {
 
         let (reply_tx, reply_rx) = mpsc::channel::<TaskReply>();
         let descriptor = Arc::new(descriptor.clone());
-        let mut participated: HashSet<(usize, Arc<str>)> = HashSet::new();
         let mut failure: Option<MultiRailError> = None;
         let mut failed_rail: Option<usize> = None;
         let mut verified_bytes = 0u64;
@@ -1431,13 +1772,18 @@ impl MultiRailClient {
                     failed_rail = Some(rail.index);
                     break 'waves;
                 }
-                match self.get_or_create_conn(rail, Arc::clone(&task.endpoint), deadline) {
+                match self.get_or_create_conn(
+                    rail,
+                    Arc::clone(&task.endpoint),
+                    task.connection_lane,
+                    deadline,
+                ) {
                     Ok(tx) => {
-                        participated.insert((rail.index, Arc::clone(&task.endpoint)));
-                        rail.stats.inflight_requests.fetch_add(1, Ordering::Relaxed);
-                        rail.stats
-                            .inflight_bytes
-                            .fetch_add(task.bytes, Ordering::Relaxed);
+                        participated.insert((
+                            rail.index,
+                            Arc::clone(&task.endpoint),
+                            task.connection_lane,
+                        ));
                         let sent = tx.send(Command::Read {
                             descriptor: Arc::clone(&descriptor),
                             stripes: Arc::new(task.stripes.clone()),
@@ -1446,10 +1792,7 @@ impl MultiRailClient {
                             reply: reply_tx.clone(),
                         });
                         if sent.is_err() {
-                            rail.stats.inflight_requests.fetch_sub(1, Ordering::Relaxed);
-                            rail.stats
-                                .inflight_bytes
-                                .fetch_sub(task.bytes, Ordering::Relaxed);
+                            self.release_inflight(rail, task.bytes);
                             failure = Some(MultiRailError::TaskFailed {
                                 rail: rail.config.device.clone(),
                                 endpoint: task.endpoint.to_string(),
@@ -1462,6 +1805,7 @@ impl MultiRailClient {
                         dispatched_total += 1;
                     }
                     Err(error) => {
+                        self.release_inflight(rail, task.bytes);
                         failed_rail = Some(rail.index);
                         failure = Some(error);
                         break 'waves;
@@ -1521,10 +1865,7 @@ impl MultiRailClient {
             // ---- verify replies, release in-flight accounting ----
             for reply in replies {
                 let rail = &self.rails[reply.rail_index];
-                rail.stats.inflight_requests.fetch_sub(1, Ordering::Relaxed);
-                rail.stats
-                    .inflight_bytes
-                    .fetch_sub(reply.expected_bytes, Ordering::Relaxed);
+                self.release_inflight(rail, reply.expected_bytes);
                 match &reply.outcome {
                     Ok(Some(outcome)) => {
                         if outcome.bytes as u64 != reply.expected_bytes {
@@ -1605,10 +1946,7 @@ impl MultiRailClient {
                 Ok(reply) => {
                     collected_total += 1;
                     let rail = &self.rails[reply.rail_index];
-                    rail.stats.inflight_requests.fetch_sub(1, Ordering::Relaxed);
-                    rail.stats
-                        .inflight_bytes
-                        .fetch_sub(reply.expected_bytes, Ordering::Relaxed);
+                    self.release_inflight(rail, reply.expected_bytes);
                 }
                 Err(_) => break,
             }
@@ -1618,7 +1956,8 @@ impl MultiRailClient {
             if let Some(index) = failed_rail {
                 self.rails[index].mark_unhealthy(self.limits.rail_cooldown);
             }
-            self.quiesce(participated.into_iter().collect());
+            self.quiesce(participated.iter().cloned().collect());
+            participated.clear();
             return Err(error);
         }
 
@@ -1660,34 +1999,39 @@ impl MultiRailClient {
             }
         }
 
-        // ---- success path: synchronous MR eviction for non-sticky buffers ----
-        if !sticky {
-            for key in &participated {
-                let ack_rx = {
-                    let conns = self.conns.lock().unwrap();
-                    match conns.get(key) {
-                        Some(entry) => {
-                            let (ack_tx, ack_rx) = mpsc::channel();
-                            if entry
-                                .tx
-                                .send(Command::EvictRegistration { base, ack: ack_tx })
-                                .is_ok()
-                            {
-                                Some(ack_rx)
-                            } else {
-                                None
-                            }
-                        }
-                        None => None,
-                    }
-                };
-                if let Some(ack_rx) = ack_rx {
-                    let _ = ack_rx.recv_timeout(self.limits.io_timeout);
-                }
+        Ok(placement.expected_bytes as usize)
+    }
+
+    fn evict_nonsticky(
+        &self,
+        participated: &HashSet<ConnKey>,
+        base: usize,
+    ) -> Result<(), MultiRailError> {
+        let mut first_error = None;
+        for key in participated {
+            let tx = self
+                .conns
+                .lock()
+                .unwrap()
+                .get(key)
+                .map(|entry| entry.tx.clone());
+            let Some(tx) = tx else {
+                continue;
+            };
+            let (ack_tx, ack_rx) = mpsc::channel();
+            let sent = tx.send(Command::EvictRegistration { base, ack: ack_tx });
+            if sent.is_err() || ack_rx.recv_timeout(self.limits.io_timeout).is_err() {
+                // Stop is ordered after any active request. Joining is the
+                // fallback barrier when eviction acknowledgement is missing.
+                self.quiesce(vec![key.clone()]);
+                first_error.get_or_insert_with(|| MultiRailError::Timeout {
+                    rail: self.rails[key.0].config.device.clone(),
+                    endpoint: key.1.to_string(),
+                    after_ms: self.limits.io_timeout.as_millis(),
+                });
             }
         }
-
-        Ok(placement.expected_bytes as usize)
+        first_error.map_or(Ok(()), Err)
     }
 
     /// Wait until `bytes` more in-flight traffic fits the per-rail and total
@@ -1705,22 +2049,35 @@ impl MultiRailClient {
                     return false;
                 }
             }
+            let admission = self.admission.lock().unwrap();
             let rail_inflight = rail.stats.inflight_bytes.load(Ordering::Relaxed);
-            if rail_inflight + bytes <= self.limits.max_inflight_bytes_per_rail {
+            if rail_inflight.saturating_add(bytes) <= self.limits.max_inflight_bytes_per_rail {
                 let total: u64 = self
                     .rails
                     .iter()
                     .map(|r| r.stats.inflight_bytes.load(Ordering::Relaxed))
                     .sum();
-                if total + bytes <= self.limits.max_inflight_bytes_total {
+                if total.saturating_add(bytes) <= self.limits.max_inflight_bytes_total {
+                    rail.stats.inflight_requests.fetch_add(1, Ordering::Relaxed);
+                    rail.stats
+                        .inflight_bytes
+                        .fetch_add(bytes, Ordering::Relaxed);
                     return true;
                 }
             }
+            drop(admission);
             if Instant::now() >= deadline {
                 return false;
             }
             std::thread::sleep(Duration::from_millis(1));
         }
+    }
+
+    fn release_inflight(&self, rail: &Rail, bytes: u64) {
+        rail.stats.inflight_requests.fetch_sub(1, Ordering::Relaxed);
+        rail.stats
+            .inflight_bytes
+            .fetch_sub(bytes, Ordering::Relaxed);
     }
 
     /// Get an existing connection's command channel or spawn a worker for
@@ -1729,13 +2086,14 @@ impl MultiRailClient {
         &self,
         rail: &Arc<Rail>,
         endpoint: Arc<str>,
+        connection_lane: usize,
         deadline: Instant,
     ) -> Result<mpsc::Sender<Command>, MultiRailError> {
-        if let Some(entry) = self
-            .conns
-            .lock()
-            .unwrap()
-            .get(&(rail.index, Arc::clone(&endpoint)))
+        if let Some(entry) =
+            self.conns
+                .lock()
+                .unwrap()
+                .get(&(rail.index, Arc::clone(&endpoint), connection_lane))
         {
             return Ok(entry.tx.clone());
         }
@@ -1746,7 +2104,10 @@ impl MultiRailClient {
         let worker_endpoint = Arc::clone(&endpoint);
         let limits = self.limits.clone();
         let handle = std::thread::Builder::new()
-            .name(format!("mrail-{}-{}", rail.config.device, endpoint))
+            .name(format!(
+                "mrail-{}-{}-{}",
+                rail.config.device, endpoint, connection_lane
+            ))
             .spawn(move || conn_worker(worker_rail, worker_endpoint, limits, command_rx, setup_tx))
             .map_err(|error| MultiRailError::TaskFailed {
                 rail: rail.config.device.clone(),
@@ -1780,13 +2141,13 @@ impl MultiRailClient {
 
         let mut conns = self.conns.lock().unwrap();
         // Another read may have created the same pair concurrently.
-        if let Some(existing) = conns.get(&(rail.index, Arc::clone(&endpoint))) {
+        if let Some(existing) = conns.get(&(rail.index, Arc::clone(&endpoint), connection_lane)) {
             let _ = command_tx.send(Command::Stop);
             let _ = handle.join();
             return Ok(existing.tx.clone());
         }
         conns.insert(
-            (rail.index, Arc::clone(&endpoint)),
+            (rail.index, Arc::clone(&endpoint), connection_lane),
             ConnEntry {
                 rail_index: rail.index,
                 tx: command_tx.clone(),
@@ -1800,7 +2161,7 @@ impl MultiRailClient {
     /// completion implies: worker loop exited → `RdmaClient` dropped → BYE
     /// sent, QP destroyed, MRs deregistered. This is the quiesce barrier that
     /// makes returning a failed read safe.
-    fn quiesce(&self, keys: Vec<(usize, Arc<str>)>) {
+    fn quiesce(&self, keys: Vec<ConnKey>) {
         let entries: Vec<ConnEntry> = {
             let mut conns = self.conns.lock().unwrap();
             keys.into_iter()
@@ -1824,7 +2185,7 @@ impl MultiRailClient {
 
 impl Drop for MultiRailClient {
     fn drop(&mut self) {
-        let keys: Vec<(usize, Arc<str>)> = {
+        let keys: Vec<ConnKey> = {
             let conns = self.conns.lock().unwrap();
             conns.keys().cloned().collect()
         };
@@ -1925,6 +2286,555 @@ mod tests {
         assert_eq!(full.weight, 2);
         assert_eq!(full.mtu, 4096);
         assert!(RailConfig::parse("  ").is_none());
+    }
+
+    #[test]
+    fn plan_routes_one_advertised_endpoint_to_two_listeners() {
+        let desc = descriptor(64, 8, 8);
+        let chunks: Vec<_> = (0..8).map(|i| chunk(i, "10.0.0.1", 8, "")).collect();
+        let placement = validate_placement(&desc, &chunks).unwrap();
+        let mut rails = test_rails(2);
+        for (index, remote) in ["10.0.0.1:50053", "10.0.1.1:50054"].into_iter().enumerate() {
+            rails[index] = Arc::new(Rail {
+                index,
+                config: RailConfig::new(format!("dev{index}"))
+                    .with_endpoint_route("10.0.0.1:50053", remote),
+                topology: RailTopology::default(),
+                stats: RailStats::default(),
+                healthy: AtomicBool::new(true),
+                unhealthy_until: Mutex::new(None),
+                gid_v4: None,
+            });
+        }
+        let plan = build_plan(
+            &placement,
+            &rails,
+            RailSelectPolicy::LeastLoaded,
+            &RailLimits::default(),
+        )
+        .unwrap();
+        assert_eq!(plan.task_count(), 2);
+        assert_eq!(plan.tasks[0].endpoint.as_ref(), "10.0.0.1:50053");
+        assert_eq!(plan.tasks[1].endpoint.as_ref(), "10.0.1.1:50054");
+        assert_eq!(plan.tasks[0].bytes, 32);
+        assert_eq!(plan.tasks[1].bytes, 32);
+    }
+
+    #[test]
+    fn affinity_matches_local_gid_to_routed_listener() {
+        let desc = descriptor(16, 2, 8);
+        let chunks = vec![chunk(0, "10.0.0.9", 8, ""), chunk(1, "10.0.0.9", 8, "")];
+        let placement = validate_placement(&desc, &chunks).unwrap();
+        let rails = [
+            ("dev0", "10.0.0.10", "10.2.0.1:50053"),
+            ("dev1", "10.1.0.10", "10.1.0.1:50054"),
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(index, (device, gid, listener))| {
+            Arc::new(Rail {
+                index,
+                config: RailConfig::new(device).with_endpoint_route("10.0.0.9:50053", listener),
+                topology: RailTopology::default(),
+                stats: RailStats::default(),
+                healthy: AtomicBool::new(true),
+                unhealthy_until: Mutex::new(None),
+                gid_v4: Some(gid.parse().unwrap()),
+            })
+        })
+        .collect::<Vec<_>>();
+        let plan = build_plan(
+            &placement,
+            &rails,
+            RailSelectPolicy::EndpointAffinity,
+            &RailLimits::default(),
+        )
+        .unwrap();
+        assert_eq!(plan.tasks[0].rail_index, 1);
+        assert_eq!(plan.tasks[0].endpoint.as_ref(), "10.1.0.1:50054");
+    }
+
+    #[test]
+    fn rail_route_spec_rejects_empty_or_duplicate_targets() {
+        let rail = RailConfig::parse("rxe1@10.0.0.1:50053->10.0.1.1:50054").unwrap();
+        assert_eq!(
+            rail.route_endpoint("10.0.0.1:50053"),
+            Some("10.0.1.1:50054")
+        );
+        assert_eq!(rail.route_endpoint("10.0.0.2:50053"), None);
+        assert!(RailConfig::parse("rxe1@10.0.0.1:50053->").is_none());
+        assert!(RailConfig::parse(
+            "rxe1@10.0.0.1:50053->10.0.1.1:50054;10.0.0.1:50053->10.0.2.1:50055"
+        )
+        .is_none());
+    }
+
+    fn install_mock_connection(
+        client: &MultiRailClient,
+        index: usize,
+        fail: bool,
+        ack_eviction: bool,
+        delay: Duration,
+        on_read: Option<mpsc::Sender<()>>,
+    ) {
+        install_mock_connection_with_lane(
+            client,
+            MockConnSpec {
+                index,
+                lane: 0,
+                fail,
+                ack_eviction,
+                delay,
+                on_read,
+                endpoint: "10.0.0.1:50053",
+            },
+        );
+    }
+
+    fn install_mock_connection_lane(
+        client: &MultiRailClient,
+        index: usize,
+        lane: usize,
+        fail: bool,
+        ack_eviction: bool,
+        on_read: Option<mpsc::Sender<()>>,
+    ) {
+        install_mock_connection_with_lane(
+            client,
+            MockConnSpec {
+                index,
+                lane,
+                fail,
+                ack_eviction,
+                delay: Duration::ZERO,
+                on_read,
+                endpoint: "10.0.0.1:50053",
+            },
+        );
+    }
+
+    fn install_mock_connection_to(
+        client: &MultiRailClient,
+        index: usize,
+        endpoint: &str,
+        on_read: Option<mpsc::Sender<()>>,
+    ) {
+        install_mock_connection_with_lane(
+            client,
+            MockConnSpec {
+                index,
+                lane: 0,
+                fail: false,
+                ack_eviction: true,
+                delay: Duration::ZERO,
+                on_read,
+                endpoint,
+            },
+        );
+    }
+
+    struct MockConnSpec<'a> {
+        index: usize,
+        lane: usize,
+        fail: bool,
+        ack_eviction: bool,
+        delay: Duration,
+        on_read: Option<mpsc::Sender<()>>,
+        endpoint: &'a str,
+    }
+
+    fn install_mock_connection_with_lane(client: &MultiRailClient, spec: MockConnSpec<'_>) {
+        let MockConnSpec {
+            index,
+            lane,
+            fail,
+            ack_eviction,
+            delay,
+            on_read,
+            endpoint,
+        } = spec;
+        let endpoint: Arc<str> = Arc::from(endpoint);
+        let (tx, rx) = mpsc::channel();
+        let worker_endpoint = Arc::clone(&endpoint);
+        let handle = std::thread::spawn(move || {
+            let mut held_acks = Vec::new();
+            while let Ok(command) = rx.recv() {
+                match command {
+                    Command::Read {
+                        descriptor,
+                        stripes,
+                        dst_base,
+                        reply,
+                        ..
+                    } => {
+                        if let Some(signal) = &on_read {
+                            let _ = signal.send(());
+                        }
+                        std::thread::sleep(delay);
+                        let (expected_bytes, expected_chunks) =
+                            expected_task_outcome(&descriptor, &stripes);
+                        for stripe in stripes.iter() {
+                            let offset = *stripe as usize * descriptor.chunk_size as usize;
+                            let length = (descriptor.size as usize - offset)
+                                .min(descriptor.chunk_size as usize);
+                            // The test models a server WRITE before its control reply.
+                            unsafe {
+                                std::ptr::write_bytes((dst_base + offset) as *mut u8, 0x42, length)
+                            };
+                        }
+                        let outcome = if fail {
+                            Err("injected rail disconnect".to_string())
+                        } else {
+                            Ok(Some(rdma::GetOutcome {
+                                bytes: expected_bytes as usize,
+                                num_chunks: expected_chunks,
+                            }))
+                        };
+                        let _ = reply.send(TaskReply {
+                            rail_index: index,
+                            endpoint: Arc::clone(&worker_endpoint),
+                            expected_bytes,
+                            expected_chunks,
+                            outcome,
+                        });
+                    }
+                    Command::EvictRegistration { ack, .. } => {
+                        if ack_eviction {
+                            let _ = ack.send(());
+                        } else {
+                            held_acks.push(ack);
+                        }
+                    }
+                    Command::Stop => break,
+                }
+            }
+        });
+        client.conns.lock().unwrap().insert(
+            (index, endpoint, lane),
+            ConnEntry {
+                rail_index: index,
+                tx,
+                handle,
+            },
+        );
+    }
+
+    #[test]
+    fn partial_rail_failure_does_not_publish_bytes_to_caller() {
+        let client =
+            MultiRailClient::new(vec![RailConfig::new("mock0"), RailConfig::new("mock1")]).unwrap();
+        install_mock_connection(&client, 0, false, true, Duration::ZERO, None);
+        install_mock_connection(&client, 1, true, true, Duration::ZERO, None);
+        let desc = descriptor(64, 8, 8);
+        let chunks: Vec<_> = (0..8).map(|i| chunk(i, "10.0.0.1", 8, "")).collect();
+        let mut destination = vec![0xA5; 64];
+        assert!(client
+            .read_object_into(&desc, &chunks, &mut destination)
+            .is_err());
+        assert_eq!(destination, vec![0xA5; 64]);
+    }
+
+    #[test]
+    fn eviction_timeout_fails_read_and_quiesces_connection() {
+        let limits = RailLimits {
+            io_timeout: Duration::from_millis(20),
+            ..RailLimits::default()
+        };
+        let client = MultiRailClient::new(vec![RailConfig::new("mock0")])
+            .unwrap()
+            .with_limits(limits);
+        install_mock_connection(&client, 0, false, false, Duration::ZERO, None);
+        let desc = descriptor(16, 2, 8);
+        let chunks = vec![chunk(0, "10.0.0.1", 8, ""), chunk(1, "10.0.0.1", 8, "")];
+        let mut destination = vec![0xA5; 16];
+        assert!(client
+            .read_object_into(&desc, &chunks, &mut destination)
+            .is_err());
+        assert_eq!(destination, vec![0xA5; 16]);
+        assert!(client.conns.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn staging_budget_rejects_oversized_read_before_dispatch() {
+        let limits = RailLimits {
+            max_staging_bytes_total: 8,
+            ..RailLimits::default()
+        };
+        let client = MultiRailClient::new(vec![RailConfig::new("mock0")])
+            .unwrap()
+            .with_limits(limits);
+        let desc = descriptor(16, 2, 8);
+        let chunks = vec![chunk(0, "10.0.0.1", 8, ""), chunk(1, "10.0.0.1", 8, "")];
+        let mut destination = vec![0xA5; 16];
+        assert!(matches!(
+            client.read_object_into(&desc, &chunks, &mut destination),
+            Err(MultiRailError::ResourceExhausted { .. })
+        ));
+        assert_eq!(destination, vec![0xA5; 16]);
+        assert!(client.conns.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn registered_memory_budget_counts_every_participating_qp() {
+        let limits = RailLimits {
+            max_registered_bytes_total: 16,
+            ..RailLimits::default()
+        };
+        let client = MultiRailClient::new(vec![RailConfig::new("mock0"), RailConfig::new("mock1")])
+            .unwrap()
+            .with_limits(limits);
+        let desc = descriptor(16, 2, 8);
+        let chunks = vec![chunk(0, "10.0.0.1", 8, ""), chunk(1, "10.0.0.1", 8, "")];
+        let mut destination = vec![0xA5; 16];
+        assert!(matches!(
+            client.read_object_into(&desc, &chunks, &mut destination),
+            Err(MultiRailError::ResourceExhausted { .. })
+        ));
+        assert_eq!(destination, vec![0xA5; 16]);
+        assert!(client.conns.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn mock_two_rails_restore_one_object_and_report_each_rail() {
+        let client =
+            MultiRailClient::new(vec![RailConfig::new("mock0"), RailConfig::new("mock1")]).unwrap();
+        install_mock_connection(&client, 0, false, true, Duration::ZERO, None);
+        install_mock_connection(&client, 1, false, true, Duration::ZERO, None);
+        let desc = descriptor(64, 8, 8);
+        let chunks: Vec<_> = (0..8).map(|i| chunk(i, "10.0.0.1", 8, "")).collect();
+        let mut destination = vec![0xA5; 64];
+        assert_eq!(
+            client
+                .read_object_into(&desc, &chunks, &mut destination)
+                .unwrap(),
+            64
+        );
+        assert_eq!(destination, vec![0x42; 64]);
+        let snapshots = client.rails_snapshot();
+        assert_eq!(snapshots[0].bytes_read, 32);
+        assert_eq!(snapshots[1].bytes_read, 32);
+        assert_eq!(client.staging_bytes_inflight(), 0);
+        assert_eq!(client.registered_bytes_reserved(), 0);
+    }
+
+    #[test]
+    fn mock_single_rail_uses_the_same_descriptor_path() {
+        let client = MultiRailClient::new(vec![RailConfig::new("mock0")]).unwrap();
+        install_mock_connection(&client, 0, false, true, Duration::ZERO, None);
+        let desc = descriptor(16, 2, 8);
+        let chunks = vec![chunk(0, "10.0.0.1", 8, ""), chunk(1, "10.0.0.1", 8, "")];
+        let mut destination = vec![0xA5; 16];
+        assert_eq!(
+            client
+                .read_object_into(&desc, &chunks, &mut destination)
+                .unwrap(),
+            16
+        );
+        assert_eq!(destination, vec![0x42; 16]);
+    }
+
+    #[test]
+    fn checksum_failure_does_not_publish_mock_bytes() {
+        let client = MultiRailClient::new(vec![RailConfig::new("mock0")]).unwrap();
+        install_mock_connection(&client, 0, false, true, Duration::ZERO, None);
+        let desc = descriptor(16, 2, 8);
+        let chunks = vec![
+            chunk(0, "10.0.0.1", 8, "0000000000000000"),
+            chunk(1, "10.0.0.1", 8, ""),
+        ];
+        let mut destination = vec![0xA5; 16];
+        assert!(matches!(
+            client.read_object_into(&desc, &chunks, &mut destination),
+            Err(MultiRailError::ChecksumMismatch { stripe: 0, .. })
+        ));
+        assert_eq!(destination, vec![0xA5; 16]);
+        assert_eq!(client.staging_bytes_inflight(), 0);
+        assert_eq!(client.registered_bytes_reserved(), 0);
+    }
+
+    #[test]
+    fn cancellation_waits_for_mock_late_completion_before_return() {
+        let client = MultiRailClient::new(vec![RailConfig::new("mock0")]).unwrap();
+        let (started_tx, started_rx) = mpsc::channel();
+        install_mock_connection(
+            &client,
+            0,
+            false,
+            true,
+            Duration::from_millis(150),
+            Some(started_tx),
+        );
+        let token = CancelToken::new();
+        let cancel = token.clone();
+        let canceller = std::thread::spawn(move || {
+            started_rx.recv().unwrap();
+            cancel.cancel();
+        });
+        let desc = descriptor(16, 2, 8);
+        let chunks = vec![chunk(0, "10.0.0.1", 8, ""), chunk(1, "10.0.0.1", 8, "")];
+        let mut destination = vec![0xA5; 16];
+        assert!(matches!(
+            client.read_object_into_cancelled(&desc, &chunks, &mut destination, &token),
+            Err(MultiRailError::Cancelled)
+        ));
+        canceller.join().unwrap();
+        assert_eq!(destination, vec![0xA5; 16]);
+        assert!(client.conns.lock().unwrap().is_empty());
+        assert_eq!(client.staging_bytes_inflight(), 0);
+        assert_eq!(client.registered_bytes_reserved(), 0);
+        destination.fill(0x33);
+        std::thread::sleep(Duration::from_millis(20));
+        assert_eq!(destination, vec![0x33; 16]);
+    }
+
+    #[test]
+    fn concurrent_dispatch_cannot_reserve_more_than_one_rail_budget() {
+        let limits = RailLimits {
+            max_inflight_bytes_per_rail: 8,
+            max_inflight_bytes_total: 8,
+            ..RailLimits::default()
+        };
+        let client = MultiRailClient::new(vec![RailConfig::new("mock0")])
+            .unwrap()
+            .with_limits(limits);
+        let rail = Arc::clone(&client.rails[0]);
+        let barrier = std::sync::Barrier::new(3);
+        let admitted = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..2)
+                .map(|_| {
+                    let rail = Arc::clone(&rail);
+                    let barrier = &barrier;
+                    let client = &client;
+                    scope.spawn(move || {
+                        barrier.wait();
+                        client.await_headroom(
+                            &rail,
+                            8,
+                            Instant::now() + Duration::from_millis(20),
+                            None,
+                        )
+                    })
+                })
+                .collect();
+            barrier.wait();
+            handles
+                .into_iter()
+                .map(|handle| handle.join().unwrap())
+                .filter(|admitted| *admitted)
+                .count()
+        });
+        assert_eq!(admitted, 1);
+        assert_eq!(rail.stats.inflight_bytes.load(Ordering::Relaxed), 8);
+    }
+
+    #[test]
+    fn waves_split_before_exceeding_total_byte_limit() {
+        let limits = RailLimits {
+            max_connections_total: 2,
+            max_inflight_bytes_total: 8,
+            ..RailLimits::default()
+        };
+        let tasks = vec![
+            TaskSpec {
+                rail_index: 0,
+                endpoint: Arc::from("a"),
+                connection_lane: 0,
+                stripes: vec![0],
+                bytes: 8,
+            },
+            TaskSpec {
+                rail_index: 1,
+                endpoint: Arc::from("b"),
+                connection_lane: 0,
+                stripes: vec![1],
+                bytes: 8,
+            },
+        ];
+        let waves = plan_waves(tasks, &limits);
+        assert_eq!(waves.len(), 2);
+    }
+
+    #[test]
+    fn split_tasks_use_distinct_connection_lanes() {
+        let desc = descriptor(64, 8, 8);
+        let chunks: Vec<_> = (0..8).map(|i| chunk(i, "10.0.0.1", 8, "")).collect();
+        let placement = validate_placement(&desc, &chunks).unwrap();
+        let limits = RailLimits {
+            task_max_stripes: 2,
+            max_connections_per_rail: 4,
+            ..RailLimits::default()
+        };
+        let plan = build_plan(
+            &placement,
+            &test_rails(1),
+            RailSelectPolicy::LeastLoaded,
+            &limits,
+        )
+        .unwrap();
+        assert_eq!(plan.tasks.len(), 4);
+        let lanes: HashSet<_> = plan.tasks.iter().map(|task| task.connection_lane).collect();
+        assert_eq!(lanes.len(), 4);
+        assert!(plan_waves(plan.tasks, &limits)
+            .iter()
+            .any(|wave| wave.len() == 4));
+    }
+
+    #[test]
+    fn split_tasks_dispatch_to_distinct_mock_workers() {
+        let limits = RailLimits {
+            task_max_stripes: 2,
+            max_connections_per_rail: 2,
+            ..RailLimits::default()
+        };
+        let client = MultiRailClient::new(vec![RailConfig::new("mock0")])
+            .unwrap()
+            .with_limits(limits);
+        let (tx0, rx0) = mpsc::channel();
+        let (tx1, rx1) = mpsc::channel();
+        install_mock_connection_lane(&client, 0, 0, false, true, Some(tx0));
+        install_mock_connection_lane(&client, 0, 1, false, true, Some(tx1));
+        let desc = descriptor(32, 4, 8);
+        let chunks: Vec<_> = (0..4).map(|i| chunk(i, "10.0.0.1", 8, "")).collect();
+        let mut destination = vec![0xA5; 32];
+        assert_eq!(
+            client
+                .read_object_into(&desc, &chunks, &mut destination)
+                .unwrap(),
+            32
+        );
+        assert!(rx0.try_recv().is_ok());
+        assert!(rx1.try_recv().is_ok());
+        assert_eq!(destination, vec![0x42; 32]);
+    }
+
+    #[test]
+    fn mock_read_routes_unmodified_placement_over_two_remote_listeners() {
+        let advertised = "10.0.0.1:50053";
+        let listeners = ["10.0.0.1:50053", "10.0.1.1:50054"];
+        let rails = listeners
+            .iter()
+            .enumerate()
+            .map(|(index, listener)| {
+                RailConfig::new(format!("mock{index}")).with_endpoint_route(advertised, *listener)
+            })
+            .collect();
+        let client = MultiRailClient::new(rails).unwrap();
+        let (tx0, rx0) = mpsc::channel();
+        let (tx1, rx1) = mpsc::channel();
+        install_mock_connection_to(&client, 0, listeners[0], Some(tx0));
+        install_mock_connection_to(&client, 1, listeners[1], Some(tx1));
+        let desc = descriptor(64, 8, 8);
+        let chunks: Vec<_> = (0..8).map(|i| chunk(i, "10.0.0.1", 8, "")).collect();
+        let mut destination = vec![0xA5; 64];
+        assert_eq!(
+            client
+                .read_object_into(&desc, &chunks, &mut destination)
+                .unwrap(),
+            64
+        );
+        assert!(rx0.try_recv().is_ok());
+        assert!(rx1.try_recv().is_ok());
+        assert_eq!(destination, vec![0x42; 64]);
     }
 
     #[test]
@@ -2160,6 +3070,7 @@ mod tests {
             .map(|i| TaskSpec {
                 rail_index: i % 2,
                 endpoint: Arc::from(format!("10.0.0.{i}:50053")),
+                connection_lane: 0,
                 stripes: vec![i as u32],
                 bytes: 8,
             })

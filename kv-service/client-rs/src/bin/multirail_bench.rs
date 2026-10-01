@@ -33,7 +33,7 @@ struct Args {
     namespace: String,
     #[arg(long)]
     object_key: String,
-    /// Comma-separated rail specs: device[:port[:gid[:weight]]]
+    /// Comma-separated rail specs: device[:port[:gid[:weight[:mtu]]]][@advertised->listener]
     #[arg(long, value_delimiter = ',')]
     rails: Vec<String>,
     /// Explicit rail↔endpoint pinning, e.g. `rxe0=10.0.0.2:50054,rxe1=10.0.0.1:50053`
@@ -41,9 +41,8 @@ struct Args {
     /// rail separated by `;`.
     #[arg(long, value_delimiter = ',')]
     pin: Vec<String>,
-    /// Rewrite per-stripe RDMA endpoints round-robin across this list (single
-    /// node exposing several NIC listeners; every listener serves every stripe
-    /// of the node). Enables true multi-rail reads against one storage node.
+    /// One listener per rail for a single-node placement. The lookup's
+    /// advertised endpoint remains unchanged; routes are applied per rail.
     #[arg(long, value_delimiter = ',')]
     alternate_endpoints: Vec<String>,
     /// Stripe→rail policy: least-loaded | endpoint-affinity | rr
@@ -64,7 +63,7 @@ struct Args {
     /// GRH hop limit for all rails (routed RoCE needs more than 1).
     #[arg(long, default_value = "1")]
     hop_limit: u8,
-    /// Endpoint rewrite map for reachability indirection, e.g.
+    /// Endpoint route map for reachability indirection, e.g.
     /// `10.0.0.2:50053=127.0.0.1:15053`: placement endpoints on the left are
     /// dialed via the right (RDMA GIDs are exchanged in-band and unaffected).
     #[arg(long, value_delimiter = ',')]
@@ -97,7 +96,6 @@ fn pattern_word(word_index: u64) -> u64 {
 
 // chunks_exact keeps a single implementation shared with the verifier below;
 // as_chunks_mut's tuple API would obscure it.
-#[allow(clippy::chunks_exact_to_as_chunks)]
 fn fill_pattern(buffer: &mut [u8]) {
     for (index, chunk) in buffer.chunks_exact_mut(8).enumerate() {
         chunk.copy_from_slice(&pattern_word(index as u64).to_le_bytes());
@@ -108,7 +106,6 @@ fn fill_pattern(buffer: &mut [u8]) {
     }
 }
 
-#[allow(clippy::chunks_exact_to_as_chunks)]
 fn verify_pattern(buffer: &[u8], label: &str) -> Result<()> {
     for (index, chunk) in buffer.chunks_exact(8).enumerate() {
         let expected = pattern_word(index as u64).to_le_bytes();
@@ -319,44 +316,28 @@ fn main() -> Result<()> {
     if let Some(size_mb) = args.put_size_mb {
         seed_object(&args, &runtime, size_mb)?;
     }
-    let mut lookup = lookup(&args, &runtime)?;
+    let lookup = lookup(&args, &runtime)?;
     if lookup.placement.is_none() {
         return Err(anyhow!(
             "lookup returned no placement (is the object striped?)"
         ));
     }
-    let original_lookup = lookup.clone();
-    // Reachability indirection: rewrite placement endpoints through the map
-    // (the RDMA GID exchange travels inside the control stream, so the data
-    // path is unaffected by the TCP detour).
+    // Keep the placement identity intact. Listener indirection is a property
+    // of the client rail, not of an object's on-disk stripe placement.
     let endpoint_map: HashMap<String, String> = args
         .endpoint_map
         .iter()
         .filter_map(|spec| spec.split_once('='))
         .map(|(from, to)| (from.trim().to_string(), to.trim().to_string()))
         .collect();
-    if !endpoint_map.is_empty() {
-        if let Some(placement) = lookup.placement.as_mut() {
-            for chunk in placement.chunks.iter_mut() {
-                if let Some(to) = endpoint_map.get(&chunk.rdma_endpoint) {
-                    chunk.rdma_endpoint = to.clone();
-                }
-            }
-        }
-    }
-    if !args.alternate_endpoints.is_empty() {
-        // Spread the node's stripes over its listeners so several rails can
-        // carry the object concurrently.
-        let endpoints = &args.alternate_endpoints;
-        if let Some(placement) = lookup.placement.as_mut() {
-            for (index, chunk) in placement.chunks.iter_mut().enumerate() {
-                chunk.rdma_endpoint = endpoints[index % endpoints.len()].clone();
-            }
-        }
+    if !endpoint_map.is_empty() && !args.alternate_endpoints.is_empty() {
+        return Err(anyhow!(
+            "--endpoint-map and --alternate-endpoints cannot be combined"
+        ));
     }
 
     let pins = parse_pins(&args.pin);
-    let rails: Vec<RailConfig> = args
+    let mut rails: Vec<RailConfig> = args
         .rails
         .iter()
         .map(|spec| RailConfig::parse(spec).ok_or_else(|| anyhow!("bad rail spec '{spec}'")))
@@ -376,16 +357,51 @@ fn main() -> Result<()> {
         })
         .collect::<Result<_>>()?;
 
+    if !args.alternate_endpoints.is_empty() {
+        if args.alternate_endpoints.len() != rails.len() {
+            return Err(anyhow!("--alternate-endpoints needs one listener per rail"));
+        }
+        let advertised: std::collections::HashSet<_> = lookup
+            .placement
+            .as_ref()
+            .expect("placement checked above")
+            .chunks
+            .iter()
+            .map(|chunk| chunk.rdma_endpoint.as_str())
+            .collect();
+        if advertised.len() != 1 {
+            return Err(anyhow!(
+                "--alternate-endpoints is for a single owning node; use per-rail @advertised->listener routes for multi-node placements"
+            ));
+        }
+        let source = *advertised.iter().next().expect("one endpoint");
+        for (rail, listener) in rails.iter_mut().zip(&args.alternate_endpoints) {
+            rail.endpoint_routes
+                .retain(|(existing, _)| existing != source);
+            rail.endpoint_routes
+                .push((source.to_string(), listener.clone()));
+        }
+    } else {
+        for rail in &mut rails {
+            for (source, listener) in &endpoint_map {
+                rail.endpoint_routes
+                    .retain(|(existing, _)| existing != source);
+                rail.endpoint_routes
+                    .push((source.clone(), listener.clone()));
+            }
+        }
+    }
+
     // Multi-rail run.
     let (multi_gbps, bytes) = run_client(&args, &lookup, rails.clone(), "multi")?;
 
     // Optional single-rail baseline for the speedup ratio (unpinned, reading
-    // the original placement: one rail must reach the advertised endpoint).
+    // the same unmodified placement through the first configured listener).
     if args.baseline && rails.len() > 1 {
         let mut baseline_rail = rails[0].clone();
         baseline_rail.endpoints.clear();
         let (single_gbps, single_bytes) =
-            run_client(&args, &original_lookup, vec![baseline_rail], "single")?;
+            run_client(&args, &lookup, vec![baseline_rail], "single")?;
         if single_bytes != bytes {
             return Err(anyhow!("single/multi rail byte counts differ"));
         }

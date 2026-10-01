@@ -848,10 +848,8 @@ impl Drop for Client {
                 ibv_destroy_qp(qp.as_ptr());
             }
             // First dereg all external MRs (same PD as self.mr; must precede dealloc_pd).
-            for slot in self.external_regions.drain(..) {
-                if let Some(region) = slot {
-                    ibv_dereg_mr(region.mr.as_ptr());
-                }
+            for region in self.external_regions.drain(..).flatten() {
+                ibv_dereg_mr(region.mr.as_ptr());
             }
             ibv_dereg_mr(self.mr.as_ptr());
             std::alloc::dealloc(self.buf_ptr, self.buf_layout);
@@ -895,6 +893,10 @@ pub unsafe extern "C" fn cs_rdma_client_new(
 }
 
 /// TCP connect to the server + set up QP. Returns non-zero on failure.
+///
+/// # Safety
+/// `client` must be a live handle from `cs_rdma_client_new`, used exclusively
+/// for this call. `server_addr` must be a valid NUL-terminated string.
 #[no_mangle]
 pub unsafe extern "C" fn cs_rdma_client_connect(
     client: *mut c_void,
@@ -918,6 +920,10 @@ pub unsafe extern "C" fn cs_rdma_client_connect(
 }
 
 /// Send GET; returns bytes written; 0 = miss; <0 = error.
+///
+/// # Safety
+/// `client` must be a live, exclusively accessed client handle and `key` a
+/// valid NUL-terminated string. Keep the client alive until the call returns.
 #[no_mangle]
 pub unsafe extern "C" fn cs_rdma_client_get(client: *mut c_void, key: *const c_char) -> i64 {
     if client.is_null() || key.is_null() {
@@ -938,6 +944,10 @@ pub unsafe extern "C" fn cs_rdma_client_get(client: *mut c_void, key: *const c_c
 }
 
 /// Get the buffer pointer. Python can do ctypes.string_at(ptr, n) for a zero-copy view.
+///
+/// # Safety
+/// `client` must be live. The returned pointer is valid only while that client
+/// exists; the caller must not read it concurrently with an in-flight WRITE.
 #[no_mangle]
 pub unsafe extern "C" fn cs_rdma_client_buffer(client: *mut c_void) -> *const u8 {
     if client.is_null() {
@@ -947,6 +957,10 @@ pub unsafe extern "C" fn cs_rdma_client_buffer(client: *mut c_void) -> *const u8
     c.buf_ptr as *const u8
 }
 
+/// Return the capacity of the client's built-in buffer.
+///
+/// # Safety
+/// `client` must be a live handle from `cs_rdma_client_new`.
 #[no_mangle]
 pub unsafe extern "C" fn cs_rdma_client_buffer_size(client: *mut c_void) -> u64 {
     if client.is_null() {
@@ -957,6 +971,10 @@ pub unsafe extern "C" fn cs_rdma_client_buffer_size(client: *mut c_void) -> u64 
 }
 
 /// Free the client (implicitly close + dealloc).
+///
+/// # Safety
+/// `client` must be a live handle returned by `cs_rdma_client_new`, with no
+/// concurrent users. Do not use or free the handle again after this call.
 #[no_mangle]
 pub unsafe extern "C" fn cs_rdma_client_free(client: *mut c_void) {
     if !client.is_null() {
@@ -999,6 +1017,10 @@ pub unsafe extern "C" fn cs_rdma_client_register_external_buffer(
 
 /// Send GET; server WRITEs into `region_id`'s external buffer at `offset`.
 /// Returns bytes_written; 0 = miss; <0 = error.
+///
+/// # Safety
+/// `client` must be live and exclusively accessed; `key` must be a valid
+/// NUL-terminated string. Keep the registered region alive until completion.
 #[no_mangle]
 pub unsafe extern "C" fn cs_rdma_client_get_into(
     client: *mut c_void,
@@ -1025,6 +1047,11 @@ pub unsafe extern "C" fn cs_rdma_client_get_into(
 
 /// Descriptor GET: server RDMA-WRITEs the version pointed to by the descriptor into
 /// the external buffer.
+///
+/// # Safety
+/// `client` and `region_id` must refer to live resources. `key`,
+/// `object_handle`, and `content_etag` must be valid NUL-terminated strings;
+/// the external buffer must stay registered until this call completes.
 #[no_mangle]
 #[allow(clippy::too_many_arguments)]
 pub unsafe extern "C" fn cs_rdma_client_get_descriptor_into(
@@ -1084,6 +1111,10 @@ pub unsafe extern "C" fn cs_rdma_client_get_descriptor_into(
 }
 
 /// Descriptor GET into the client's built-in buffer.
+///
+/// # Safety
+/// `client` must be live and exclusively accessed; `key`, `object_handle`,
+/// and `content_etag` must be valid NUL-terminated strings for this call.
 #[no_mangle]
 #[allow(clippy::too_many_arguments)]
 pub unsafe extern "C" fn cs_rdma_client_get_descriptor(
@@ -1135,6 +1166,10 @@ pub unsafe extern "C" fn cs_rdma_client_get_descriptor(
 
 /// Unregister an external buffer (dereg_mr). Caller is responsible for freeing their
 /// own memory. Returns 0 on success, <0 on error.
+///
+/// # Safety
+/// `client` must be live and exclusively accessed. The region must have no
+/// in-flight RDMA operations when it is unregistered.
 #[no_mangle]
 pub unsafe extern "C" fn cs_rdma_client_unregister_external_buffer(
     client: *mut c_void,
@@ -1164,6 +1199,11 @@ pub unsafe extern "C" fn cs_rdma_client_unregister_external_buffer(
 ///
 /// Fully symmetric with the GET path: GET is the server WRITEing into our buffer;
 /// PUT is us WRITEing into the server's slab.
+///
+/// # Safety
+/// `client` and `region_id` must refer to live resources, `key` must be a
+/// valid NUL-terminated string, and the source range must remain valid and
+/// unchanged until the operation completes.
 #[no_mangle]
 pub unsafe extern "C" fn cs_rdma_client_put(
     client: *mut c_void,

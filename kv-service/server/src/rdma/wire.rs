@@ -581,7 +581,8 @@ pub struct PutStripesReqMsg {
 }
 
 pub fn send_put_stripes_req(stream: &mut TcpStream, msg: &PutStripesReqMsg) -> Result<()> {
-    let mut frame = Vec::with_capacity(64 + msg.key.len() + msg.object_handle.len() + msg.stripes.len() * 12);
+    let mut frame =
+        Vec::with_capacity(64 + msg.key.len() + msg.object_handle.len() + msg.stripes.len() * 12);
     frame.push(MSG_PUT_STRIPES_REQ);
     write_string_u16(&mut frame, &msg.key, "key")?;
     write_string_u16(&mut frame, &msg.object_handle, "object_handle")?;
@@ -700,7 +701,6 @@ pub fn recv_put_stripes_resp(stream: &mut TcpStream) -> Result<PutStripesRespMsg
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Write as _;
     use std::net::{TcpListener, TcpStream};
 
     /// Round-trip a PutReq frame through a loopback socket with the given

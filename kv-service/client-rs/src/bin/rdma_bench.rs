@@ -910,6 +910,10 @@ mod tests {
     #[test]
     fn readable_selector_encodes_canonical_key() {
         let args = Args {
+            mode: "get".to_string(),
+            put_mb: 480,
+            ttl_seconds: 0,
+            sge_segments: 0,
             key: None,
             namespace: Some("rust-bench".to_string()),
             object_key: Some("rdma-checksum0/__combined__".to_string()),

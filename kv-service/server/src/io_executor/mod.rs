@@ -10,6 +10,16 @@
 mod aligned_buffer;
 mod tier_a;
 
+// Linux assigns different open(2) bit values to O_DIRECT on x86 and arm64.
+// Keep this shared by both executors without adding a required libc dependency
+// to the default server build; the tests compare it with libc on the host.
+#[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+const O_DIRECT_FLAG: i32 = 0o200000;
+#[cfg(all(target_os = "linux", not(target_arch = "aarch64")))]
+const O_DIRECT_FLAG: i32 = 0o40000;
+#[cfg(not(target_os = "linux"))]
+const O_DIRECT_FLAG: i32 = 0;
+
 pub use aligned_buffer::{AlignedBuffer, PooledAlignedBuffer, READ_BUFFER_POOL};
 
 #[cfg(all(feature = "io-uring", target_os = "linux"))]

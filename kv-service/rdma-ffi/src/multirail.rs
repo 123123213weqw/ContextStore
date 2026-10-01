@@ -29,10 +29,9 @@
 //!     const char* checksum;   // optional xxh3-64 lowercase hex; NULL/"" skips
 //! } CsMrChunk;
 //!
-//! // Read the whole object into buffer (server RDMA-WRITEs each stripe at
-//! // buffer + stripe_index * chunk_size). sticky=1 keeps per-rail registrations
-//! // cached across calls — the buffer must then be a long-lived pinned pool
-//! // region that outlives the reader and is never freed/reused otherwise.
+//! // Read the whole object atomically into buffer. `sticky` is accepted for
+//! // ABI compatibility; reads use a private staging allocation until all
+//! // rails and checksums pass, so the caller buffer is unchanged on failure.
 //! // Returns bytes read (>=0) or -1; human-readable error text in err_buf.
 //! int64_t cs_mr_read(void* reader,
 //!                    const CsMrDescriptor* descriptor,
@@ -119,8 +118,11 @@ fn write_err(err_buf: *mut c_char, err_buf_len: u32, message: &str) {
     let capacity = err_buf_len as usize - 1;
     let len = bytes.len().min(capacity);
     unsafe {
-        std::ptr::copy_nonoverlapping(bytes.as_ptr(), err_buf as *mut u8, len);
-        *err_buf.add(len) = 0;
+        let target = std::slice::from_raw_parts_mut(err_buf, err_buf_len as usize);
+        for (dst, src) in target[..len].iter_mut().zip(&bytes[..len]) {
+            *dst = *src as c_char;
+        }
+        target[len] = 0;
     }
 }
 
@@ -133,6 +135,11 @@ unsafe fn cstr<'a>(ptr: *const c_char) -> Result<&'a str, MultiRailError> {
         .map_err(|_| MultiRailError::InvalidPlacement("non-utf8 string in descriptor".into()))
 }
 
+/// Create a multi-rail reader from C strings.
+///
+/// # Safety
+/// `rail_specs` must point to `rail_count` valid, NUL-terminated strings for
+/// the duration of this call. The returned handle must be freed exactly once.
 #[no_mangle]
 pub unsafe extern "C" fn cs_mr_new(
     rail_specs: *const *const c_char,
@@ -210,6 +217,12 @@ fn to_placement(
     }
 }
 
+/// Read one object while keeping the caller's buffer unchanged on failure.
+///
+/// # Safety
+/// `reader` must be a live handle from `cs_mr_new`; `descriptor` and `chunks`
+/// must remain valid for this call, and `buffer` must address `buffer_len`
+/// writable bytes. Do not free or mutate these objects concurrently.
 #[no_mangle]
 pub unsafe extern "C" fn cs_mr_read(
     reader: *mut c_void,
@@ -218,7 +231,7 @@ pub unsafe extern "C" fn cs_mr_read(
     chunk_count: u32,
     buffer: *mut u8,
     buffer_len: u64,
-    sticky: c_int,
+    _sticky: c_int,
     err_buf: *mut c_char,
     err_buf_len: u32,
 ) -> i64 {
@@ -248,25 +261,24 @@ pub unsafe extern "C" fn cs_mr_read(
             return -1;
         }
     };
-    let result = if sticky != 0 {
-        reader.client.read_object_into_raw(
-            &pb_descriptor,
-            &pb_chunks,
-            buffer,
-            buffer_len as usize,
-            true,
-        )
-    } else {
-        // SAFETY: the caller guarantees buffer..buffer+len stays valid and
-        // unmoved for the duration of the call (it is synchronous).
-        reader.client.read_object_into_raw(
-            &pb_descriptor,
-            &pb_chunks,
-            buffer,
-            buffer_len as usize,
-            false,
-        )
+    let len = match usize::try_from(buffer_len) {
+        Ok(len) => len,
+        Err(_) => {
+            write_err(
+                err_buf,
+                err_buf_len,
+                "cs_mr_read: buffer length exceeds usize",
+            );
+            return -1;
+        }
     };
+    // SAFETY: the caller owns buffer..buffer+len for this synchronous call.
+    // The safe API stages writes and commits to this slice only after success.
+    let result = reader.client.read_object_into(
+        &pb_descriptor,
+        &pb_chunks,
+        std::slice::from_raw_parts_mut(buffer, len),
+    );
     match result {
         Ok(bytes) => bytes as i64,
         Err(error) => {
@@ -288,6 +300,11 @@ fn fill_str_field(dst: &mut [c_char], value: &str) {
     dst[len] = 0;
 }
 
+/// Copy per-rail statistics into a caller-provided array.
+///
+/// # Safety
+/// `reader` must be live and `out` must point to at least `max` writable
+/// `CsMrRailStats` entries. Do not free the reader concurrently.
 #[no_mangle]
 pub unsafe extern "C" fn cs_mr_rail_stats(
     reader: *mut c_void,
@@ -329,6 +346,11 @@ pub unsafe extern "C" fn cs_mr_rail_stats(
     count as i32
 }
 
+/// Destroy a multi-rail reader.
+///
+/// # Safety
+/// `reader` must be a live handle from `cs_mr_new` and must not be used again
+/// or concurrently after this call.
 #[no_mangle]
 pub unsafe extern "C" fn cs_mr_free(reader: *mut c_void) {
     if !reader.is_null() {

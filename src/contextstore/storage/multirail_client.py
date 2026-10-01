@@ -10,28 +10,32 @@ cancelled read quiesces every participating connection before returning.
 Typical use with the gRPC client::
 
     from contextstore.kvservice_client.client import KVClient
+    from contextstore.kvservice_client.types import ObjectKey
     from contextstore.storage.multirail_client import MultiRailReader
+    import ctypes
 
-    grpc = KVClient("http://10.0.0.1:50051")
-    reader = MultiRailReader(["mlx5_0", "mlx5_1"])          # local HCAs
-    buffer = pinned_pool_region(size)                        # long-lived
+    grpc = KVClient("10.0.0.1:50051")
+    reader = MultiRailReader([
+        "mlx5_0@10.0.0.1:50053->10.0.0.1:50053",
+        "mlx5_1@10.0.0.1:50053->10.0.1.1:50054",
+    ])  # two independent listeners on one owning node
+    buffer = ctypes.create_string_buffer(size)
 
-    lookup = grpc.lookup_object("ns", "key")                 # descriptor+placement
-    n = reader.read_into(buffer, lookup, sticky=True)        # all rails in parallel
+    lookup = grpc.lookup_object_with_placement(ObjectKey("ns", "key"))
+    n = reader.read_into(buffer, lookup, verify_with=grpc)   # version recheck
     for stats in reader.rail_stats():
         print(stats)                                        # per-rail metrics
 
-``sticky=True`` keeps the per-rail registrations cached across reads; the
-buffer must then be a long-lived pinned pool region that outlives the reader
-and is never freed or reused for non-RDMA purposes while it is open.
+The C ABI accepts ``sticky`` for compatibility but always stages the read in
+private memory. The caller buffer changes only after every rail succeeds and
+integrity checks pass.
 """
 
 from __future__ import annotations
 
 import ctypes
-import os
 from dataclasses import dataclass
-from typing import Sequence
+from typing import Any, Sequence
 
 from .rdma_client import _find_lib
 
@@ -129,7 +133,7 @@ class MultiRailReader:
         io_timeout_ms: int = 30_000,
         lib_path: str | None = None,
     ) -> None:
-        """``rails`` entries are ``device[:port[:gid[:weight[:mtu]]]]`` specs."""
+        """``rails`` entries may include ``@advertised->listener`` routes."""
         if not rails:
             raise ValueError("at least one rail is required")
         self._lib = ctypes.CDLL(lib_path or _find_lib(), use_errno=True)
@@ -138,9 +142,7 @@ class MultiRailReader:
         array = (ctypes.c_char_p * len(specs))(*specs)
         self._handle = self._lib.cs_mr_new(array, len(specs), io_timeout_ms)
         if not self._handle:
-            raise MultiRailError(
-                f"cs_mr_new failed (rails={list(rails)}); check device names/GIDs"
-            )
+            raise MultiRailError(f"cs_mr_new failed (rails={list(rails)}); check device names/GIDs")
 
     def _setup_prototypes(self) -> None:
         lib = self._lib
@@ -178,6 +180,7 @@ class MultiRailReader:
         sticky: bool = False,
         buffer_addr: int | None = None,
         buffer_len: int | None = None,
+        verify_with: Any | None = None,
     ) -> int:
         """Read the looked-up object into ``buffer`` across all healthy rails.
 
@@ -185,6 +188,11 @@ class MultiRailReader:
         ``.descriptor`` (with namespace/object_key via ``.key``, handle,
         generation, etag, layout, size, striping fields) and ``.placement``
         (with ``.chunks``). Returns the number of bytes placed in the buffer.
+        On failure, the caller buffer is unchanged. Pass a KVClient as
+        ``verify_with`` to re-lookup the descriptor after transfer and reject
+        a concurrent rewrite before publishing bytes. This strict mode adds
+        one gRPC lookup and a second private buffer. ``sticky`` is accepted
+        for compatibility and has no effect on registration caching.
         """
         descriptor = lookup.descriptor
         placement = getattr(lookup, "placement", None)
@@ -196,6 +204,11 @@ class MultiRailReader:
 
         addr = buffer_addr if buffer_addr is not None else ctypes.addressof(buffer)
         length = buffer_len if buffer_len is not None else ctypes.sizeof(buffer)
+        if length < descriptor.size:
+            raise MultiRailError(f"buffer too small: need {descriptor.size} bytes, have {length}")
+        staged = ctypes.create_string_buffer(descriptor.size) if verify_with else None
+        receive_addr = ctypes.addressof(staged) if staged is not None else addr
+        receive_len = descriptor.size if staged is not None else length
 
         c_desc = _CsMrDescriptor(
             namespace=key.namespace.encode(),
@@ -226,15 +239,36 @@ class MultiRailReader:
             ctypes.byref(c_desc),
             array,
             len(c_chunks),
-            ctypes.c_void_p(addr),
-            length,
+            ctypes.c_void_p(receive_addr),
+            receive_len,
             1 if sticky else 0,
             err,
             _ERR_LEN,
         )
         if result < 0:
             raise MultiRailError(err.value.decode(errors="replace") or "cs_mr_read failed")
+        if result != descriptor.size:
+            raise MultiRailError(
+                f"partial multi-rail read: received {result} of {descriptor.size} bytes"
+            )
+        if verify_with is not None:
+            latest = verify_with.lookup_object_with_placement(key)
+            if latest is None or self._descriptor_identity(
+                latest.descriptor
+            ) != self._descriptor_identity(descriptor):
+                raise MultiRailError("object version changed during multi-rail read")
+            ctypes.memmove(addr, receive_addr, result)
         return int(result)
+
+    @staticmethod
+    def _descriptor_identity(descriptor: Any) -> tuple[str, int, str, int, int]:
+        return (
+            descriptor.object_handle,
+            descriptor.object_generation,
+            descriptor.content_etag,
+            descriptor.layout_version,
+            descriptor.size,
+        )
 
     def rail_stats(self) -> list[RailStats]:
         """Snapshot of per-rail health, throughput, error and in-flight stats."""
