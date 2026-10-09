@@ -1625,6 +1625,9 @@ impl MultiRailClient {
         // Full-coverage invariant: the per-task byte checks must add up to
         // the whole object, otherwise stripes went missing.
         if verified_bytes != placement.expected_bytes {
+            if !sticky {
+                self.evict_participated_registrations(&participated, base);
+            }
             return Err(MultiRailError::ByteCountMismatch {
                 rail: "aggregate".into(),
                 endpoint: "aggregate".into(),
@@ -1651,6 +1654,9 @@ impl MultiRailClient {
                 };
                 let actual = format!("{:016x}", twox_hash::xxh3::hash64(view));
                 if !expected.eq_ignore_ascii_case(&actual) {
+                    if !sticky {
+                        self.evict_participated_registrations(&participated, base);
+                    }
                     return Err(MultiRailError::ChecksumMismatch {
                         stripe: *stripe,
                         expected: expected.clone(),
@@ -1662,29 +1668,7 @@ impl MultiRailClient {
 
         // ---- success path: synchronous MR eviction for non-sticky buffers ----
         if !sticky {
-            for key in &participated {
-                let ack_rx = {
-                    let conns = self.conns.lock().unwrap();
-                    match conns.get(key) {
-                        Some(entry) => {
-                            let (ack_tx, ack_rx) = mpsc::channel();
-                            if entry
-                                .tx
-                                .send(Command::EvictRegistration { base, ack: ack_tx })
-                                .is_ok()
-                            {
-                                Some(ack_rx)
-                            } else {
-                                None
-                            }
-                        }
-                        None => None,
-                    }
-                };
-                if let Some(ack_rx) = ack_rx {
-                    let _ = ack_rx.recv_timeout(self.limits.io_timeout);
-                }
-            }
+            self.evict_participated_registrations(&participated, base);
         }
 
         Ok(placement.expected_bytes as usize)
@@ -1800,6 +1784,40 @@ impl MultiRailClient {
     /// completion implies: worker loop exited → `RdmaClient` dropped → BYE
     /// sent, QP destroyed, MRs deregistered. This is the quiesce barrier that
     /// makes returning a failed read safe.
+    /// Evict the caller-buffer registrations from all participating
+    /// connections (non-sticky reads). Runs on the success path AND on
+    /// post-dispatch error returns — a cached MR must never outlive the
+    /// caller's buffer and pin its freed pages.
+    fn evict_participated_registrations(
+        &self,
+        participated: &std::collections::HashSet<(usize, Arc<str>)>,
+        base: usize,
+    ) {
+        for key in participated {
+            let ack_rx = {
+                let conns = self.conns.lock().unwrap();
+                match conns.get(key) {
+                    Some(entry) => {
+                        let (ack_tx, ack_rx) = mpsc::channel();
+                        if entry
+                            .tx
+                            .send(Command::EvictRegistration { base, ack: ack_tx })
+                            .is_ok()
+                        {
+                            Some(ack_rx)
+                        } else {
+                            None
+                        }
+                    }
+                    None => None,
+                }
+            };
+            if let Some(ack_rx) = ack_rx {
+                let _ = ack_rx.recv_timeout(self.limits.io_timeout);
+            }
+        }
+    }
+
     fn quiesce(&self, keys: Vec<(usize, Arc<str>)>) {
         let entries: Vec<ConnEntry> = {
             let mut conns = self.conns.lock().unwrap();
