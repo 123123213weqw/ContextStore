@@ -306,3 +306,103 @@ fn stale_descriptor_is_reported_as_relookup() {
         other => panic!("expected StaleDescriptor, got {other:?}"),
     }
 }
+
+#[test]
+#[ignore = "requires an RDMA-enabled ContextStore server with stripe checksums in placements"]
+fn corrupted_stripe_checksum_is_detected_client_side() {
+    let fixture = seed("multirail-e2e", &unique_key("cksum"), 128);
+    let mut lookup = remap_lookup_endpoints(&fixture.lookup);
+    let (stripe_index, corrupted) = {
+        let placement = lookup.placement.as_mut().expect("placement");
+        assert!(
+            !placement.chunks.is_empty(),
+            "testbed must stripe the seeded object"
+        );
+        let original = placement.chunks[0].checksum.clone();
+        assert!(
+            !original.is_empty(),
+            "testbed must enable stripe checksums (server verify_stripe_checksums = true)"
+        );
+
+        // Flip one hex digit: keep the encoding valid, change the value.
+        let mut corrupted = original;
+        let flipped = if corrupted.starts_with('0') { '1' } else { '0' };
+        corrupted.replace_range(0..1, &flipped.to_string());
+        placement.chunks[0].checksum = corrupted.clone();
+        (placement.chunks[0].stripe_index, corrupted)
+    };
+
+    let client = MultiRailClient::new(rails_from_env())
+        .expect("create client")
+        .with_limits(limits());
+    let mut buffer = vec![0u8; fixture.size];
+    match client.read_lookup_into(&lookup, &mut buffer) {
+        Err(MultiRailError::ChecksumMismatch { stripe, expected, .. }) => {
+            assert_eq!(stripe, stripe_index);
+            assert_eq!(expected, corrupted);
+        }
+        other => panic!("expected ChecksumMismatch, got {other:?}"),
+    }
+
+    // The failed read must not leave the buffer poisoned or MRs pinned: the
+    // same buffer serves a clean read of the intact descriptor afterwards.
+    let clean = MultiRailClient::new(rails_from_env())
+        .expect("create clean client")
+        .with_limits(limits());
+    let bytes = clean
+        .read_lookup_into(&remap_lookup_endpoints(&fixture.lookup), &mut buffer)
+        .expect("clean read after checksum failure");
+    assert_eq!(bytes, fixture.size);
+    assert!(verify_pattern(&buffer), "clean content mismatch");
+}
+
+#[test]
+#[ignore = "requires an RDMA-enabled ContextStore server with 2+ listeners"]
+fn partial_rail_failure_fails_whole_read_safely() {
+    let fixture = seed("multirail-e2e", &unique_key("partial"), 128);
+    let rails = rails_from_env();
+    let dead_endpoint = env_or("CS_MR_DEAD_ENDPOINT", "127.0.0.1:59999");
+
+    // Sabotage only half of the stripes: the other half still completes, so
+    // the read ends partially done — the whole read must still fail safely
+    // (no torn buffer reported as success, no leaked in-flight state).
+    let mut chunks = fixture
+        .lookup
+        .placement
+        .as_ref()
+        .expect("placement")
+        .chunks
+        .clone();
+    assert!(chunks.len() >= 2, "testbed must stripe the seeded object");
+    for (index, chunk) in chunks.iter_mut().enumerate() {
+        if index % 2 == 0 {
+            chunk.rdma_endpoint = dead_endpoint.clone();
+        }
+    }
+
+    let client = MultiRailClient::new(unpinned(&rails))
+        .expect("create client")
+        .with_limits(limits());
+    let mut buffer = vec![0xA5u8; fixture.size];
+    match client.read_object_into(&fixture.lookup.descriptor, &chunks, &mut buffer) {
+        Err(error @ (MultiRailError::TaskFailed { .. } | MultiRailError::Timeout { .. })) => {
+            let text = error.to_string();
+            assert!(
+                text.contains(dead_endpoint.as_str()),
+                "error should mention the dead endpoint: {text}"
+            );
+        }
+        other => panic!("expected safe failure, got {other:?}"),
+    }
+
+    // Late-write protection under partial completion: reuse the very same
+    // buffer for a fully live read and verify every byte.
+    let recovered = MultiRailClient::new(rails)
+        .expect("create recovery client")
+        .with_limits(limits());
+    let bytes = recovered
+        .read_lookup_into(&remap_lookup_endpoints(&fixture.lookup), &mut buffer)
+        .expect("recovery read after partial failure");
+    assert_eq!(bytes, fixture.size);
+    assert!(verify_pattern(&buffer), "recovered content mismatch");
+}
